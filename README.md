@@ -1,8 +1,8 @@
 # TP1 - Serviços de Monitorização Urbana para One Health
 
-**Universidade de Trás-os-Montes e Alto Douro (UTAD)** 
-**Licenciatura em Engenharia Informática | 3º Ano** 
-**Unidade Curricular:** Sistemas Distribuídos 2025/2026  
+**Universidade de Trás-os-Montes e Alto Douro (UTAD)**<br>
+**Licenciatura em Engenharia Informática | 3º Ano**<br>
+**Unidade Curricular:** Sistemas Distribuídos 2025/2026<br>
 **Docentes:** Hugo Paredes, Tiago Pinto, Cristiano Pendão  
 
 ## 📌 Sobre o Projeto
