@@ -1,0 +1,14 @@
+C:\Users\lucas\Sensor\bin\Debug\net9.0\Sensor.exe
+C:\Users\lucas\Sensor\bin\Debug\net9.0\Sensor.deps.json
+C:\Users\lucas\Sensor\bin\Debug\net9.0\Sensor.runtimeconfig.json
+C:\Users\lucas\Sensor\bin\Debug\net9.0\Sensor.dll
+C:\Users\lucas\Sensor\bin\Debug\net9.0\Sensor.pdb
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.AssemblyInfoInputs.cache
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.AssemblyInfo.cs
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.csproj.CoreCompileInputs.cache
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.dll
+C:\Users\lucas\Sensor\obj\Debug\net9.0\refint\Sensor.dll
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.pdb
+C:\Users\lucas\Sensor\obj\Debug\net9.0\Sensor.genruntimeconfig.cache
+C:\Users\lucas\Sensor\obj\Debug\net9.0\ref\Sensor.dll

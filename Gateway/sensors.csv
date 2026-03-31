@@ -1,0 +1,4 @@
+sensor_id;estado;zona;tipos_dados;last_sync
+S101;ativo;ZONA_PARQUE;TEMP,RUIDO,HUM;2026-03-31T16:04:40
+S102;manutencao;ZONA_ESCOLAR;TEMP,PM2.5,RUIDO;2026-03-31T15:55:30
+S103;desativado;ZONA_CENTRO;TEMP,HUM;-

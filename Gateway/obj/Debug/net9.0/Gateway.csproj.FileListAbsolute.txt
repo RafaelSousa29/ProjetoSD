@@ -1,0 +1,14 @@
+C:\Users\lucas\Gateway\bin\Debug\net9.0\Gateway.exe
+C:\Users\lucas\Gateway\bin\Debug\net9.0\Gateway.deps.json
+C:\Users\lucas\Gateway\bin\Debug\net9.0\Gateway.runtimeconfig.json
+C:\Users\lucas\Gateway\bin\Debug\net9.0\Gateway.dll
+C:\Users\lucas\Gateway\bin\Debug\net9.0\Gateway.pdb
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.AssemblyInfoInputs.cache
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.AssemblyInfo.cs
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.csproj.CoreCompileInputs.cache
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.dll
+C:\Users\lucas\Gateway\obj\Debug\net9.0\refint\Gateway.dll
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.pdb
+C:\Users\lucas\Gateway\obj\Debug\net9.0\Gateway.genruntimeconfig.cache
+C:\Users\lucas\Gateway\obj\Debug\net9.0\ref\Gateway.dll
