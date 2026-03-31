@@ -249,12 +249,16 @@ async Task DesligarSensor()
     {
         heartbeatAtivo = false;
 
+        // Pequena pausa para garantir que o loop de heartbeat sai
+        await Task.Delay(300);
+
         if (ligado && writer != null && reader != null)
         {
             await socketLock.WaitAsync();
             try
             {
                 string discMsg = $"DISCONNECT|{sensorId}";
+                Console.WriteLine($"[SENSOR] A enviar: {discMsg}");
                 await writer.WriteLineAsync(discMsg);
 
                 string? response = await reader.ReadLineAsync();
