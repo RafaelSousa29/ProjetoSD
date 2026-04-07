@@ -27,3 +27,18 @@ C:\Users\lucas\source\repos\ProjetoSD\Gateway\obj\Debug\net9.0\refint\Gateway.dl
 C:\Users\lucas\source\repos\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.pdb
 C:\Users\lucas\source\repos\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.genruntimeconfig.cache
 C:\Users\lucas\source\repos\ProjetoSD\Gateway\obj\Debug\net9.0\ref\Gateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\bin\Debug\net9.0\Gateway.exe
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\bin\Debug\net9.0\Gateway.deps.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\bin\Debug\net9.0\Gateway.runtimeconfig.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\bin\Debug\net9.0\Gateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\bin\Debug\net9.0\Gateway.pdb
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.AssemblyInfoInputs.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.AssemblyInfo.cs
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.csproj.CoreCompileInputs.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.sourcelink.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\refint\Gateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.pdb
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\Gateway.genruntimeconfig.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Gateway\obj\Debug\net9.0\ref\Gateway.dll

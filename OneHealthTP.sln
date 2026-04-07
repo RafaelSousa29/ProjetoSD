@@ -9,6 +9,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Gateway", "Gateway\Gateway.
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Sensor", "Sensor\Sensor.csproj", "{DEBB8884-7D2F-460D-8F27-2CD16648FD73}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SimuladorGateway", "SimuladorGateway\SimuladorGateway.csproj", "{38E78C43-DCA6-4749-B6A6-E439CCCE7733}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -55,8 +57,23 @@ Global
 		{DEBB8884-7D2F-460D-8F27-2CD16648FD73}.Release|x64.Build.0 = Release|Any CPU
 		{DEBB8884-7D2F-460D-8F27-2CD16648FD73}.Release|x86.ActiveCfg = Release|Any CPU
 		{DEBB8884-7D2F-460D-8F27-2CD16648FD73}.Release|x86.Build.0 = Release|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Debug|x64.Build.0 = Debug|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Debug|x86.Build.0 = Debug|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Release|Any CPU.Build.0 = Release|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Release|x64.ActiveCfg = Release|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Release|x64.Build.0 = Release|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Release|x86.ActiveCfg = Release|Any CPU
+		{38E78C43-DCA6-4749-B6A6-E439CCCE7733}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {9791DB2A-FCF7-4BDD-A147-F5040D9E8475}
 	EndGlobalSection
 EndGlobal

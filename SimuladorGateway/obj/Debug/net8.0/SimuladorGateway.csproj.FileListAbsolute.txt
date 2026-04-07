@@ -1,0 +1,15 @@
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\bin\Debug\net8.0\SimuladorGateway.exe
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\bin\Debug\net8.0\SimuladorGateway.deps.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\bin\Debug\net8.0\SimuladorGateway.runtimeconfig.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\bin\Debug\net8.0\SimuladorGateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\bin\Debug\net8.0\SimuladorGateway.pdb
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.AssemblyInfoInputs.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.AssemblyInfo.cs
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.csproj.CoreCompileInputs.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.sourcelink.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\refint\SimuladorGateway.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.pdb
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\SimuladorGateway.genruntimeconfig.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\SimuladorGateway\obj\Debug\net8.0\ref\SimuladorGateway.dll

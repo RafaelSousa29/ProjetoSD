@@ -1,0 +1,2 @@
+2026-04-07T15:00:00 | Gateway: GATEWAY_DIRETO | Sensor: S101 | Valor: 24.5
+2026-04-07T15:02:30 | Gateway: GW_CENTRO | Sensor:  S101 | Valor: 25.0

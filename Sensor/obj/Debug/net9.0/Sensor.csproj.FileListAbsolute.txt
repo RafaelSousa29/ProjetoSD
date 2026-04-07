@@ -27,3 +27,18 @@ C:\Users\lucas\source\repos\ProjetoSD\Sensor\obj\Debug\net9.0\refint\Sensor.dll
 C:\Users\lucas\source\repos\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.pdb
 C:\Users\lucas\source\repos\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.genruntimeconfig.cache
 C:\Users\lucas\source\repos\ProjetoSD\Sensor\obj\Debug\net9.0\ref\Sensor.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\bin\Debug\net9.0\Sensor.exe
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\bin\Debug\net9.0\Sensor.deps.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\bin\Debug\net9.0\Sensor.runtimeconfig.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\bin\Debug\net9.0\Sensor.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\bin\Debug\net9.0\Sensor.pdb
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.AssemblyInfoInputs.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.AssemblyInfo.cs
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.csproj.CoreCompileInputs.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.sourcelink.json
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\refint\Sensor.dll
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.pdb
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\Sensor.genruntimeconfig.cache
+C:\Users\braso\Documents\3ano Universidade\2 Semestre\Sistemas Distribuidos\Projeto SD\ProjetoSD\Sensor\obj\Debug\net9.0\ref\Sensor.dll

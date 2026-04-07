@@ -1,0 +1,1 @@
+2026-04-07T15:02:00 | Gateway: GW_CENTRO | Sensor: S103 | Valor: 30 
