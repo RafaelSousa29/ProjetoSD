@@ -1,5 +1,13 @@
-﻿################################################################################
-# Este arquivo .gitignore foi criado automaticamente pelo Microsoft(R) Visual Studio.
-################################################################################
+﻿# Bloquear pastas de compilação (Onde estavam os conflitos)
+[Bb]in/
+[Ob]j/
 
-/.vs
+# Bloquear ficheiros executáveis e temporários
+*.exe
+*.dll
+*.pdb
+*.user
+*.suo
+
+# Pastas do Visual Studio
+.vs/
