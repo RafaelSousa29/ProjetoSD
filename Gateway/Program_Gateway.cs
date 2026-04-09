@@ -60,29 +60,50 @@ async Task HandleSensorAsync(TcpClient client)
 
                 switch (command)
                 {
-                    case "CONNECT": // --- TAREFA 2.1: VALIDAÇÃO ---
+                    case "CONNECT": // --- TAREFA 2.1: VALIDAÇÃO RIGOROSA ---
                         if (parts.Length < 4) break;
                         string id = parts[1];
-                        string tiposStr = parts[2];
+                        string tiposSolicitadosRaw = parts[2]; // O que o sensor diz que tem (ex: "temperatura")
                         string zona = parts[3];
 
-                        var info = FindSensor(id);
+                        var info = FindSensor(id); // O que o CSV diz que ele tem (ex: "TEMP,HUM")
 
                         if (info != null && info.Estado != "desativado" && info.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
                         {
-                            currentSensorId = id;
-                            currentTipos = new HashSet<string>(tiposStr.Split(','), StringComparer.OrdinalIgnoreCase);
-                            isConnected = true;
+                            // 1. Criar lista do que o sensor enviou agora
+                            var tiposSolicitados = tiposSolicitadosRaw.Split(',')
+                                                                     .Select(t => t.Trim())
+                                                                     .ToList();
 
-                            UpdateSensorEntry(id, info.Estado);
+                            // 2. VALIDAR: Todos os tipos que o sensor enviou existem na lista do CSV?
+                            // Ex: Se o sensor mandou "temperatura" mas o CSV diz "TEMP", isto vai dar FALSE.
+                            bool todosOsTiposSaoValidos = tiposSolicitados.All(ts =>
+                                info.TiposDados.Any(csvT => csvT.Equals(ts, StringComparison.OrdinalIgnoreCase)));
 
-                            string resp = (info.Estado == "manutencao") ? "CONN_ACK|MANUTENCAO" : "CONN_ACK|ACEITE";
-                            await writer.WriteLineAsync(resp);
-                            Console.WriteLine($"[LIGAR] Sensor {id} conectado com sucesso.");
+                            if (todosOsTiposSaoValidos)
+                            {
+                                currentSensorId = id;
+                                // Guardamos os tipos autorizados (usamos os do sensor porque já confirmámos que são válidos)
+                                currentTipos = new HashSet<string>(tiposSolicitados, StringComparer.OrdinalIgnoreCase);
+                                isConnected = true;
+
+                                UpdateSensorEntry(id, info.Estado);
+
+                                string resp = (info.Estado == "manutencao") ? "CONN_ACK|MANUTENCAO" : "CONN_ACK|ACEITE";
+                                await writer.WriteLineAsync(resp);
+                                Console.WriteLine($"[ACEITE] Sensor {id} conectado. Tipos: {string.Join(", ", currentTipos)}");
+                            }
+                            else
+                            {
+                                // Se o tipo for "temperatura" em vez de "TEMP", ele cai aqui:
+                                await writer.WriteLineAsync("CONN_ACK|RECUSADO");
+                                Console.WriteLine($"[RECUSADO] Sensor {id} tentou tipos não autorizados: {tiposSolicitadosRaw}");
+                            }
                         }
                         else
                         {
                             await writer.WriteLineAsync("CONN_ACK|RECUSADO");
+                            Console.WriteLine($"[RECUSADO] Sensor {id} falhou na validação de ID, Estado ou Zona.");
                         }
                         break;
 

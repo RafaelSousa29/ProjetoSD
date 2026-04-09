@@ -11,12 +11,12 @@
 using System;
 using System.Reflection;
 
-[assembly: System.Reflection.AssemblyCompanyAttribute("Sensor")]
+[assembly: System.Reflection.AssemblyCompanyAttribute("SimuladorGateway")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
 [assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f01de09408a6ec7e115f9113a984821286b5f828")]
-[assembly: System.Reflection.AssemblyProductAttribute("Sensor")]
-[assembly: System.Reflection.AssemblyTitleAttribute("Sensor")]
+[assembly: System.Reflection.AssemblyProductAttribute("SimuladorGateway")]
+[assembly: System.Reflection.AssemblyTitleAttribute("SimuladorGateway")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
 
 // Gerado pela classe WriteCodeFragment do MSBuild.
