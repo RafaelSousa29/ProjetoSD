@@ -157,7 +157,7 @@ async Task HandleSensorAsync(TcpClient client)
                             Console.WriteLine($"[DESLIGAR] Sensor {currentSensorId} solicitou o encerramento da ligação.");
 
                             // Conforme o protocolo: atualizar estado para desativado ao fechar
-                            UpdateSensorEntry(currentSensorId, "desativado");
+                            //UpdateSensorEntry(currentSensorId, "desativado");
 
                             await writer.WriteLineAsync("ACK_DISCONNECT|SUCESSO");
                             return; // Encerra a comunicação com este sensor

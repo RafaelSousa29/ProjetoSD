@@ -12,3 +12,7 @@
 /Gateway/obj
 /Servidor/obj
 /Sensor/obj
+/Servidor/bin/Debug/net9.0
+/Gateway/bin/Debug/net9.0
+/Gateway/gateway_history.txt
+/Sensor/bin/Debug/net9.0
