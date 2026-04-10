@@ -7,3 +7,8 @@
 /bin
 /obj
 /.vscode
+/Servidor/obj/Debug/net9.0
+*.csproj
+/Gateway/obj
+/Servidor/obj
+/Sensor/obj
