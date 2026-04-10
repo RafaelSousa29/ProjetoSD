@@ -20,3 +20,5 @@
 /Gateway/gateway_history.txt
 /Sensor/bin/Debug/net9.0
 /Servidor/server_log.txt
+/Gateway/bin/Debug/net9.0/Gateway.dll
+/Gateway/bin/Debug/net9.0/Gateway.exe
