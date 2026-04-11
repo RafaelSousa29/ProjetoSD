@@ -4,6 +4,14 @@ using System.Threading;
 
 const string GATEWAY_IP = "127.0.0.1";
 const int GATEWAY_PORT = 5000;
+const string MEDICOES_FILE = "medicoes.txt";
+const int INTERVALO_LEITURA_MS = 5000; // 5 segundos
+const int HEARTBEAT_NORMAL_MS = 10000; // 10 segundos
+const int HEARTBEAT_MANUTENCAO_MS = 180000; // 3 minutos
+const int NIVEL_BATERIA_INICIAL = 100;
+const int LIMITE_BATERIA_CRITICA = 20;
+const int CONSUMO_DATA = 2; // Consumo por envio de DATA
+const int CONSUMO_HEARTBEAT = 1; // Consumo por heartbeat
 
 Console.Write("ID do sensor: ");
 string sensorId = Console.ReadLine()?.Trim() ?? "S101";
@@ -21,277 +29,347 @@ StreamWriter? writer = null;
 bool ligado = false;
 bool modoManutencao = false;
 bool heartbeatAtivo = false;
+bool sensorEmExecucao = true;
 int heartbeatCount = 0;
+int nivelBateria = NIVEL_BATERIA_INICIAL;
+long ultimaLeitura = 0;
 
-SemaphoreSlim socketLock = new SemaphoreSlim(1, 1);
+object lockSocket = new object();
+object lockFicheiro = new object();
 
 try
 {
+    Console.WriteLine("[SENSOR] A conectar ao gateway...");
+    
     client = new TcpClient();
-    await client.ConnectAsync(GATEWAY_IP, GATEWAY_PORT);
+    client.Connect(GATEWAY_IP, GATEWAY_PORT);
 
     NetworkStream stream = client.GetStream();
     reader = new StreamReader(stream, Encoding.UTF8);
     writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
 
     string connectMsg = $"CONNECT|{sensorId}|{tiposDados}|{zona}";
-    await writer.WriteLineAsync(connectMsg);
+    writer.WriteLine(connectMsg);
+    writer.Flush();
 
-    string? response = await reader.ReadLineAsync();
+    string? response = reader.ReadLine();
     Console.WriteLine($"[SENSOR] Resposta: {response}");
 
     if (response == "CONN_ACK|ACEITE")
     {
         ligado = true;
         modoManutencao = false;
-        Console.WriteLine("[SENSOR] Ligação aceite em modo normal.");
+        Console.WriteLine("[SENSOR] ✓ Ligação aceite em modo normal.");
+        Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}%");
 
         heartbeatAtivo = true;
-        _ = Task.Run(HeartbeatLoop);
+        Thread heartbeatThread = new Thread(HeartbeatLoop)
+        {
+            Name = $"Heartbeat-{sensorId}",
+            IsBackground = false
+        };
+        heartbeatThread.Start();
     }
     else if (response == "CONN_ACK|MANUTENCAO")
     {
         ligado = true;
         modoManutencao = true;
-        Console.WriteLine("[SENSOR] Ligação aceite em modo manutenção.");
-        Console.WriteLine("[SENSOR] O heartbeat automático fica desativado.");
+        Console.WriteLine("[SENSOR] ✓ Ligação aceite em modo manutenção.");
+        Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}%");
     }
     else
     {
-        Console.WriteLine("[SENSOR] Ligação recusada. O programa vai terminar.");
-        reader.Dispose();
-        writer.Dispose();
-        client.Dispose();
+        Console.WriteLine("[SENSOR] ✗ Ligação recusada. Encerrando.");
+        reader?.Dispose();
+        writer?.Dispose();
+        client?.Dispose();
         return;
     }
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"[SENSOR] Erro ao ligar ao gateway: {ex.Message}");
+    Console.WriteLine($"[SENSOR] ✗ Erro ao ligar ao gateway: {ex.Message}");
     return;
 }
 
-while (true)
+Console.WriteLine("[SENSOR] Iniciando leitura automática do ficheiro...\n");
+
+// Thread para leitura automática de medições
+Thread leituraMedicoesThread = new Thread(LerMedicoesAutomatico)
 {
-    Console.WriteLine();
-    Console.WriteLine("===== SENSOR =====");
+    Name = $"LeituraMedicoes-{sensorId}",
+    IsBackground = false
+};
+leituraMedicoesThread.Start();
 
-    if (!modoManutencao)
-    {
-        Console.WriteLine("1 - Enviar medição");
-        Console.WriteLine("2 - Desligar");
-        Console.Write("Opção: ");
-        string? opcao = Console.ReadLine();
+// Esperar que o sensor finalize naturalmente
+leituraMedicoesThread.Join();
 
-        try
-        {
-            switch (opcao)
-            {
-                case "1":
-                    await EnviarMedicao();
-                    break;
+// Garantir desligamento
+DesligarSensor();
+Console.WriteLine("[SENSOR] Programa encerrado.");
+return;
 
-                case "2":
-                    await DesligarSensor();
-                    return;
-
-                default:
-                    Console.WriteLine("Opção inválida.");
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[SENSOR] Erro: {ex.Message}");
-            await FecharLigacaoLocal();
-            return;
-        }
-    }
-    else
-    {
-        Console.WriteLine("1 - Enviar medição");
-        Console.WriteLine("2 - Enviar heartbeat manual");
-        Console.WriteLine("3 - Desligar");
-        Console.Write("Opção: ");
-        string? opcao = Console.ReadLine();
-
-        try
-        {
-            switch (opcao)
-            {
-                case "1":
-                    await EnviarMedicao();
-                    break;
-
-                case "2":
-                    await EnviarHeartbeatManual();
-                    break;
-
-                case "3":
-                    await DesligarSensor();
-                    return;
-
-                default:
-                    Console.WriteLine("Opção inválida.");
-                    break;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[SENSOR] Erro: {ex.Message}");
-            await FecharLigacaoLocal();
-            return;
-        }
-    }
-}
-
-async Task EnviarMedicao()
+void EnviarMedicao(string tipo, string valor)
 {
     if (!ligado || writer == null || reader == null)
     {
-        Console.WriteLine("O sensor não está ligado ao gateway.");
+        Console.WriteLine("[SENSOR] ✗ Sensor não ligado ao gateway.");
         return;
     }
 
-    Console.Write("Tipo de dado: ");
-    string tipo = Console.ReadLine()?.Trim() ?? "TEMP";
-
-    Console.Write("Valor: ");
-    string valor = Console.ReadLine()?.Trim() ?? "0";
+    if (nivelBateria - CONSUMO_DATA <= 0)
+    {
+        Console.WriteLine("[SENSOR] ✗ Bateria insuficiente.");
+        return;
+    }
 
     string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
 
-    await socketLock.WaitAsync();
-    try
-    {
-        string dataMsg = $"DATA|{sensorId}|{timestamp}|{tipo}|{valor}";
-        await writer.WriteLineAsync(dataMsg);
-
-        string? response = await reader.ReadLineAsync();
-        Console.WriteLine($"[SENSOR] Resposta: {response}");
-    }
-    finally
-    {
-        socketLock.Release();
-    }
-}
-
-async Task EnviarHeartbeatManual()
-{
-    if (!ligado || writer == null || reader == null)
-    {
-        Console.WriteLine("O sensor não está ligado ao gateway.");
-        return;
-    }
-
-    await socketLock.WaitAsync();
-    try
-    {
-        string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
-        string hbMsg = $"HEARTBEAT|{sensorId}|{timestamp}";
-        await writer.WriteLineAsync(hbMsg);
-
-        string? response = await reader.ReadLineAsync();
-        Console.WriteLine($"[SENSOR] Resposta: {response}");
-    }
-    finally
-    {
-        socketLock.Release();
-    }
-}
-
-async Task HeartbeatLoop()
-{
-    while (heartbeatAtivo)
+    lock (lockSocket)
     {
         try
         {
-            await Task.Delay(10000);
+            string dataMsg = $"DATA|{sensorId}|{timestamp}|{tipo}|{valor}";
+            writer.WriteLine(dataMsg);
+            writer.Flush();
+
+            string? response = reader.ReadLine();
+            Console.WriteLine($"[SENSOR] {tipo}={valor} | Resposta: {response}");
+
+            // Consumir bateria
+            nivelBateria -= CONSUMO_DATA;
+            Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}%");
+
+            // Verificar bateria crítica
+            if (nivelBateria <= LIMITE_BATERIA_CRITICA && !modoManutencao)
+            {
+                EnviarNotificacaoBateria();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SENSOR] ✗ Erro ao enviar medição: {ex.Message}");
+        }
+    }
+}
+
+void EnviarNotificacaoBateria()
+{
+    if (!ligado || writer == null || reader == null)
+    {
+        return;
+    }
+
+    try
+    {
+        lock (lockSocket)
+        {
+            string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+            string notifyMsg = $"NOTIFY|{sensorId}|{timestamp}|LOW_BATTERY";
+            writer.WriteLine(notifyMsg);
+            writer.Flush();
+
+            string? response = reader.ReadLine();
+            Console.WriteLine($"[SENSOR] ⚠ Notificação de bateria fraca enviada. Resposta: {response}");
+
+            // Entrar em modo de manutenção
+            modoManutencao = true;
+            heartbeatAtivo = false;
+            Console.WriteLine("[SENSOR] ⚠ Entrando em modo de manutenção...");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SENSOR] ✗ Erro ao enviar notificação: {ex.Message}");
+    }
+}
+
+void LerMedicoesAutomatico()
+{
+    while (sensorEmExecucao && ligado)
+    {
+        try
+        {
+            if (nivelBateria <= 0)
+            {
+                Console.WriteLine("[SENSOR] ✗ Bateria descarregada. Desligando automaticamente...");
+                sensorEmExecucao = false;
+                break;
+            }
+
+            // Tentar ler novas linhas do ficheiro
+            if (File.Exists(MEDICOES_FILE))
+            {
+                lock (lockFicheiro)
+                {
+                    try
+                    {
+                        var linhas = File.ReadAllLines(MEDICOES_FILE);
+                        
+                        // Processar apenas linhas novas desde a última leitura
+                        if (linhas.Length > ultimaLeitura)
+                        {
+                            for (long i = ultimaLeitura; i < linhas.Length; i++)
+                            {
+                                if (!ligado || !sensorEmExecucao || nivelBateria <= 0)
+                                    break;
+
+                                string medicao = linhas[i].Trim();
+                                
+                                if (string.IsNullOrEmpty(medicao))
+                                    continue;
+
+                                // Esperado formato: "TIPO|VALOR"
+                                var partes = medicao.Split('|');
+                                if (partes.Length == 2)
+                                {
+                                    string tipo = partes[0].Trim();
+                                    string valor = partes[1].Trim();
+
+                                    if (nivelBateria - CONSUMO_DATA > 0)
+                                    {
+                                        EnviarMedicao(tipo, valor);
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine("[SENSOR] ✗ Bateria insuficiente para enviar medição.");
+                                        break;
+                                    }
+                                }
+
+                                ultimaLeitura = i + 1;
+                            }
+                        }
+                    }
+                    catch (IOException)
+                    {
+                        // Ficheiro está sendo escrito, tenta novamente depois
+                    }
+                }
+            }
+
+            // Aguardar antes de verificar novamente
+            Thread.Sleep(INTERVALO_LEITURA_MS);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SENSOR] ✗ Erro no loop principal: {ex.Message}");
+            Thread.Sleep(2000);
+        }
+    }
+}
+
+void HeartbeatLoop()
+{
+    while (heartbeatAtivo && ligado)
+    {
+        try
+        {
+            // Determinar intervalo conforme o modo
+            int intervaloHeartbeat = modoManutencao ? HEARTBEAT_MANUTENCAO_MS : HEARTBEAT_NORMAL_MS;
+            Thread.Sleep(intervaloHeartbeat);
 
             if (!heartbeatAtivo || !ligado || writer == null || reader == null)
                 continue;
 
-            await socketLock.WaitAsync();
-            try
+            // Verificar se tem bateria
+            if (nivelBateria - CONSUMO_HEARTBEAT <= 0)
             {
-                string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
-                string hbMsg = $"HEARTBEAT|{sensorId}|{timestamp}";
-                await writer.WriteLineAsync(hbMsg);
-
-                string? response = await reader.ReadLineAsync();
-                heartbeatCount++;
-
-                if (response == null || !response.StartsWith("ACK_HEARTBEAT|SUCESSO"))
-                {
-                    Console.WriteLine($"[SENSOR] Erro no heartbeat: {response}");
-                }
-                else if (heartbeatCount % 10 == 0)
-                {
-                    Console.WriteLine($"[SENSOR] {heartbeatCount} heartbeats enviados com sucesso.");
-                }
+                Console.WriteLine("[SENSOR] ✗ Bateria insuficiente para heartbeat.");
+                heartbeatAtivo = false;
+                sensorEmExecucao = false;
+                break;
             }
-            finally
+
+            lock (lockSocket)
             {
-                socketLock.Release();
+                try
+                {
+                    string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+                    string hbMsg = $"HEARTBEAT|{sensorId}|{timestamp}";
+                    writer.WriteLine(hbMsg);
+                    writer.Flush();
+
+                    string? response = reader.ReadLine();
+                    heartbeatCount++;
+
+                    // Consumir bateria
+                    nivelBateria -= CONSUMO_HEARTBEAT;
+
+                    if (response == null || !response.StartsWith("ACK_HEARTBEAT|SUCESSO"))
+                    {
+                        Console.WriteLine($"[SENSOR] ✗ Erro no heartbeat: {response} | Bateria: {nivelBateria}%");
+                    }
+                    else if (heartbeatCount % 10 == 0)
+                    {
+                        Console.WriteLine($"[SENSOR] ✓ {heartbeatCount} heartbeats enviados. Bateria: {nivelBateria}%");
+                    }
+
+                    // Verificar bateria crítica
+                    if (nivelBateria <= LIMITE_BATERIA_CRITICA && !modoManutencao)
+                    {
+                        EnviarNotificacaoBateria();
+                    }
+                }
+                catch (IOException)
+                {
+                    Console.WriteLine("[SENSOR] ✗ Conexão perdida com gateway.");
+                    heartbeatAtivo = false;
+                    sensorEmExecucao = false;
+                    break;
+                }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SENSOR] Erro no heartbeat: {ex.Message}");
+            Console.WriteLine($"[SENSOR] ✗ Erro no heartbeat: {ex.Message}");
             break;
         }
     }
 }
 
-async Task DesligarSensor()
+void DesligarSensor()
 {
     try
     {
         heartbeatAtivo = false;
+        sensorEmExecucao = false;
 
-        // Pequena pausa para garantir que o loop de heartbeat sai
-        await Task.Delay(300);
+        // Pequena pausa para garantir que as threads saem
+        Thread.Sleep(300);
 
         if (ligado && writer != null && reader != null)
         {
-            await socketLock.WaitAsync();
-            try
+            lock (lockSocket)
             {
-                string discMsg = $"DISCONNECT|{sensorId}";
-                Console.WriteLine($"[SENSOR] A enviar: {discMsg}");
-                await writer.WriteLineAsync(discMsg);
+                try
+                {
+                    string discMsg = $"DISCONNECT|{sensorId}";
+                    Console.WriteLine($"[SENSOR] A enviar: {discMsg}");
+                    writer.WriteLine(discMsg);
+                    writer.Flush();
 
-                string? response = await reader.ReadLineAsync();
-                Console.WriteLine($"[SENSOR] Resposta: {response}");
-            }
-            finally
-            {
-                socketLock.Release();
+                    string? response = reader.ReadLine();
+                    Console.WriteLine($"[SENSOR] Resposta: {response}");
+                }
+                catch { }
             }
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[SENSOR] Erro ao desligar: {ex.Message}");
+        Console.WriteLine($"[SENSOR] ✗ Erro ao desligar: {ex.Message}");
     }
     finally
     {
-        await FecharLigacaoLocal();
+        try { reader?.Dispose(); } catch { }
+        try { writer?.Dispose(); } catch { }
+        try { client?.Dispose(); } catch { }
+
+        reader = null;
+        writer = null;
+        client = null;
+        ligado = false;
     }
-}
-
-async Task FecharLigacaoLocal()
-{
-    heartbeatAtivo = false;
-    ligado = false;
-
-    try { reader?.Dispose(); } catch { }
-    try { writer?.Dispose(); } catch { }
-    try { client?.Dispose(); } catch { }
-
-    reader = null;
-    writer = null;
-    client = null;
-
-    await Task.CompletedTask;
 }

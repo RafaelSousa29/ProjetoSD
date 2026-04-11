@@ -17,3 +17,5 @@
 /Sensor/bin/Debug/net9.0
 /Servidor/server_log.txt
 /Gateway/sensors.csv
+/DataGenerator/bin/Debug/net9.0
+/DataGenerator/obj

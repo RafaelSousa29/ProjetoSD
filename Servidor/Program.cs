@@ -5,20 +5,52 @@ using System.Text;
 const int PORT = 6000;
 const string LOG_FILE = "server_log.txt";
 
+object lockLog = new object();
+bool servidorEmExecucao = true;
+
 TcpListener listener = new TcpListener(IPAddress.Any, PORT);
 listener.Start();
 
 Console.WriteLine($"[SERVIDOR] À escuta na porta {PORT}...");
+Console.WriteLine("[SERVIDOR] Escreva 'stop' para encerrar.");
 
-while (true)
+// Thread para escuta de comandos
+Thread commandThread = new Thread(ListenarComandos)
 {
-    TcpClient gatewayClient = await listener.AcceptTcpClientAsync();
-    Console.WriteLine("[SERVIDOR] Gateway ligado.");
-    _ = Task.Run(() => HandleGatewayAsync(gatewayClient));
+    Name = "CommandListener",
+    IsBackground = false
+};
+commandThread.Start();
+
+// Loop principal - Aceitar conexões de gateways
+while (servidorEmExecucao)
+{
+    try
+    {
+        TcpClient gatewayClient = listener.AcceptTcpClient();
+        Console.WriteLine("[SERVIDOR] Gateway ligado.");
+        
+        // Criar thread para cada gateway
+        Thread gatewayThread = new Thread(HandleGateway)
+        {
+            Name = $"Gateway-{DateTime.Now:HHmmss}",
+            IsBackground = true
+        };
+        gatewayThread.Start(gatewayClient);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SERVIDOR] Erro ao aceitar conexão: {ex.Message}");
+    }
 }
 
-static async Task HandleGatewayAsync(TcpClient client)
+return;
+
+void HandleGateway(object? clientObj)
 {
+    if (clientObj is not TcpClient client)
+        return;
+
     using (client)
     using (NetworkStream stream = client.GetStream())
     using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
@@ -26,16 +58,25 @@ static async Task HandleGatewayAsync(TcpClient client)
     {
         try
         {
-            while (true)
+            while (servidorEmExecucao)
             {
-                string? line = await reader.ReadLineAsync();
+                string? line = reader.ReadLine();
                 if (line == null) break;
 
                 string log = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {line}";
                 Console.WriteLine($"[SERVIDOR] {log}");
-                File.AppendAllText(LOG_FILE, log + Environment.NewLine);
+                
+                lock (lockLog)
+                {
+                    try
+                    {
+                        File.AppendAllText(LOG_FILE, log + Environment.NewLine);
+                    }
+                    catch { }
+                }
 
-                await writer.WriteLineAsync("SERVER_ACK|SUCESSO");
+                writer.WriteLine("SERVER_ACK|SUCESSO");
+                writer.Flush();
             }
         }
         catch (Exception ex)
@@ -45,4 +86,22 @@ static async Task HandleGatewayAsync(TcpClient client)
     }
 
     Console.WriteLine("[SERVIDOR] Gateway desligado.");
+}
+
+void ListenarComandos()
+{
+    while (servidorEmExecucao)
+    {
+        try
+        {
+            string? cmd = Console.ReadLine();
+            if (cmd?.ToLower() == "stop")
+            {
+                Console.WriteLine("[SERVIDOR] A encerrar...");
+                servidorEmExecucao = false;
+                break;
+            }
+        }
+        catch { }
+    }
 }

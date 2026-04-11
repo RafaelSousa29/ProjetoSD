@@ -13,7 +13,11 @@ const string HISTORY_FILE = "gateway_history.txt";
 // --- CONFIGURAÇÕES DE LOTE (Tarefa 2.2) ---
 const int MAX_BATCH_SIZE = 5;
 const int BATCH_TIMEOUT_MS = 300000;
+object lockBuffer = new object();
+object lockCsv = new object();
 List<string> _dataBuffer = new List<string>();
+
+bool gatewayEmExecucao = true;
 
 // --- INICIALIZAÇÃO ---
 EnsureCsvExists();
@@ -23,20 +27,51 @@ listener.Start();
 Console.WriteLine($"[GATEWAY {GATEWAY_ID}] Ativo na porta {GATEWAY_PORT}...");
 Console.WriteLine("Comandos: Escreva 'send' para forçar o envio do lote atual.");
 
-// Loop para envio automático por tempo (Tarefa 2.2)
-_ = Task.Run(BatchTimerLoop);
-
-// Loop para comandos manuais na consola
-_ = Task.Run(ManualCommandLoop);
-
-while (true)
+// Thread para envio automático por tempo (Tarefa 2.2)
+Thread batchTimerThread = new Thread(BatchTimerLoop)
 {
-    TcpClient sensorClient = await listener.AcceptTcpClientAsync();
-    _ = Task.Run(() => HandleSensorAsync(sensorClient));
+    Name = "BatchTimer",
+    IsBackground = false
+};
+batchTimerThread.Start();
+
+// Thread para comandos manuais na consola
+Thread commandThread = new Thread(ManualCommandLoop)
+{
+    Name = "CommandListener",
+    IsBackground = false
+};
+commandThread.Start();
+
+// Loop principal - Aceitar conexões de sensores
+Console.WriteLine("[GATEWAY] À espera de sensores...");
+while (gatewayEmExecucao)
+{
+    try
+    {
+        TcpClient sensorClient = listener.AcceptTcpClient();
+        
+        // Criar thread para cada sensor conectado
+        Thread sensorThread = new Thread(HandleSensor)
+        {
+            Name = $"Sensor-{DateTime.Now:HHmmss}",
+            IsBackground = true
+        };
+        sensorThread.Start(sensorClient);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[GATEWAY] Erro ao aceitar conexão: {ex.Message}");
+    }
 }
 
-async Task HandleSensorAsync(TcpClient client)
+return;
+
+void HandleSensor(object? clientObj)
 {
+    if (clientObj is not TcpClient client)
+        return;
+
     using (client)
     using (NetworkStream stream = client.GetStream())
     using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
@@ -50,7 +85,7 @@ async Task HandleSensorAsync(TcpClient client)
         {
             while (true)
             {
-                string? line = await reader.ReadLineAsync();
+                string? line = reader.ReadLine();
                 if (line == null) break;
 
                 string[] parts = line.Split('|');
@@ -63,10 +98,10 @@ async Task HandleSensorAsync(TcpClient client)
                     case "CONNECT": // --- TAREFA 2.1: VALIDAÇÃO RIGOROSA ---
                         if (parts.Length < 4) break;
                         string id = parts[1];
-                        string tiposSolicitadosRaw = parts[2]; // O que o sensor diz que tem (ex: "temperatura")
+                        string tiposSolicitadosRaw = parts[2];
                         string zona = parts[3];
 
-                        var info = FindSensor(id); // O que o CSV diz que ele tem (ex: "TEMP,HUM")
+                        var info = FindSensor(id);
 
                         if (info != null && info.Estado != "desativado" && info.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
                         {
@@ -90,19 +125,22 @@ async Task HandleSensorAsync(TcpClient client)
                                 UpdateSensorEntry(id, info.Estado);
 
                                 string resp = (info.Estado == "manutencao") ? "CONN_ACK|MANUTENCAO" : "CONN_ACK|ACEITE";
-                                await writer.WriteLineAsync(resp);
+                                writer.WriteLine(resp);
+                                writer.Flush();
                                 Console.WriteLine($"[ACEITE] Sensor {id} conectado. Tipos: {string.Join(", ", currentTipos)}");
                             }
                             else
                             {
                                 // Se o tipo for "temperatura" em vez de "TEMP", ele cai aqui:
-                                await writer.WriteLineAsync("CONN_ACK|RECUSADO");
+                                writer.WriteLine("CONN_ACK|RECUSADO");
+                                writer.Flush();
                                 Console.WriteLine($"[RECUSADO] Sensor {id} tentou tipos não autorizados: {tiposSolicitadosRaw}");
                             }
                         }
                         else
                         {
-                            await writer.WriteLineAsync("CONN_ACK|RECUSADO");
+                            writer.WriteLine("CONN_ACK|RECUSADO");
+                            writer.Flush();
                             Console.WriteLine($"[RECUSADO] Sensor {id} falhou na validação de ID, Estado ou Zona.");
                         }
                         break;
@@ -118,18 +156,29 @@ async Task HandleSensorAsync(TcpClient client)
 
                                 LogDataLocally(line);
 
-                                _dataBuffer.Add(line);
-                                if (_dataBuffer.Count >= MAX_BATCH_SIZE)
+                                lock (lockBuffer)
                                 {
-                                    _ = ForwardBatchToServer();
+                                    _dataBuffer.Add(line);
+                                    if (_dataBuffer.Count >= MAX_BATCH_SIZE)
+                                    {
+                                        // Forçar envio em thread dedicada
+                                        Thread envioThread = new Thread(ForwardBatchToServer)
+                                        {
+                                            Name = $"EnvioBatch-{DateTime.Now:HHmmss}",
+                                            IsBackground = true
+                                        };
+                                        envioThread.Start();
+                                    }
                                 }
 
                                 UpdateSensorEntry(currentSensorId, "ativo");
-                                await writer.WriteLineAsync("DATA_ACK|SUCESSO");
+                                writer.WriteLine("DATA_ACK|SUCESSO");
+                                writer.Flush();
                             }
                             else
                             {
-                                await writer.WriteLineAsync("DATA_ACK|ERRO|TIPO_NAO_SUPORTADO");
+                                writer.WriteLine("DATA_ACK|ERRO|TIPO_NAO_SUPORTADO");
+                                writer.Flush();
                             }
                         }
                         break;
@@ -138,28 +187,27 @@ async Task HandleSensorAsync(TcpClient client)
                         if (isConnected && currentSensorId != null)
                         {
                             UpdateSensorEntry(currentSensorId, "ativo");
-                            await writer.WriteLineAsync("ACK_HEARTBEAT|SUCESSO");
+                            writer.WriteLine("ACK_HEARTBEAT|SUCESSO");
+                            writer.Flush();
                         }
                         break;
 
                     case "NOTIFY":
-                        if (parts.Length >= 4 && parts[2] == "LOW_BATTERY")
+                        if (parts.Length >= 4 && parts[3] == "LOW_BATTERY")
                         {
-                            Console.WriteLine($"[ALERTA] Bateria Baixa no Sensor {parts[1]}: {parts[3]}");
+                            Console.WriteLine($"[ALERTA] Bateria Baixa no Sensor {parts[1]}: {parts[2]}");
                             UpdateSensorEntry(parts[1], "manutencao");
                         }
-                        await writer.WriteLineAsync("ACK_NOTIFY|SUCESSO");
+                        writer.WriteLine("ACK_NOTIFY|SUCESSO");
+                        writer.Flush();
                         break;
 
                     case "DISCONNECT": // --- CORREÇÃO: RECEBER DESLIGAMENTO ---
                         if (isConnected && currentSensorId != null)
                         {
                             Console.WriteLine($"[DESLIGAR] Sensor {currentSensorId} solicitou o encerramento da ligação.");
-
-                            // Conforme o protocolo: atualizar estado para desativado ao fechar
-                            //UpdateSensorEntry(currentSensorId, "desativado");
-
-                            await writer.WriteLineAsync("ACK_DISCONNECT|SUCESSO");
+                            writer.WriteLine("ACK_DISCONNECT|SUCESSO");
+                            writer.Flush();
                             return; // Encerra a comunicação com este sensor
                         }
                         break;
@@ -168,103 +216,140 @@ async Task HandleSensorAsync(TcpClient client)
         }
         catch (Exception ex)
         {
-            // Agora a variável 'ex' é usada aqui:
             Console.WriteLine($"[GATEWAY] Erro na ligação: {ex.Message}");
         }
     }
 }
 
-async Task ForwardBatchToServer()
+void ForwardBatchToServer()
 {
-    if (_dataBuffer.Count == 0) return;
-
-    List<string> batch = new List<string>(_dataBuffer);
-    _dataBuffer.Clear();
-
-    string msg = $"DATA_BATCH|{GATEWAY_ID}|{batch.Count}|{string.Join("#", batch)}";
-
-    try
+    lock (lockBuffer)
     {
-        using TcpClient server = new TcpClient();
-        await server.ConnectAsync(SERVER_IP, SERVER_PORT);
+        if (_dataBuffer.Count == 0) return;
 
-        using NetworkStream stream = server.GetStream();
-        using StreamWriter sw = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-        using StreamReader sr = new StreamReader(stream, Encoding.UTF8);
+        List<string> batch = new List<string>(_dataBuffer);
+        _dataBuffer.Clear();
 
-        await sw.WriteLineAsync(msg);
+        string msg = $"DATA_BATCH|{GATEWAY_ID}|{batch.Count}|{string.Join("#", batch)}";
 
-        string? ack = await sr.ReadLineAsync();
-        Console.WriteLine($"[BATCH] Lote de {batch.Count} enviado. Resposta do servidor: {ack}");
-    }
-    catch
-    {
-        Console.WriteLine("[ERRO] Servidor offline. Dados mantidos no histórico local.");
-    }
-}
-
-async Task BatchTimerLoop()
-{
-    while (true)
-    {
-        await Task.Delay(BATCH_TIMEOUT_MS);
-        await ForwardBatchToServer();
-    }
-}
-
-async Task ManualCommandLoop()
-{
-    while (true)
-    {
-        string? cmd = Console.ReadLine();
-        if (cmd?.ToLower() == "send")
+        try
         {
-            Console.WriteLine("[MANUAL] A forçar envio do lote...");
-            await ForwardBatchToServer();
+            TcpClient server = new TcpClient();
+            server.Connect(SERVER_IP, SERVER_PORT);
+
+            using (NetworkStream stream = server.GetStream())
+            using (StreamWriter sw = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true })
+            using (StreamReader sr = new StreamReader(stream, Encoding.UTF8))
+            {
+                sw.WriteLine(msg);
+                sw.Flush();
+
+                string? ack = sr.ReadLine();
+                Console.WriteLine($"[BATCH] Lote de {batch.Count} enviado. Resposta do servidor: {ack}");
+            }
+            server.Close();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ERRO] Servidor offline. Dados mantidos no histórico local. {ex.Message}");
+        }
+    }
+}
+
+void BatchTimerLoop()
+{
+    while (gatewayEmExecucao)
+    {
+        try
+        {
+            Thread.Sleep(BATCH_TIMEOUT_MS);
+            ForwardBatchToServer();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BATCH] Erro no timer: {ex.Message}");
+        }
+    }
+}
+
+void ManualCommandLoop()
+{
+    while (gatewayEmExecucao)
+    {
+        try
+        {
+            string? cmd = Console.ReadLine();
+            if (cmd?.ToLower() == "send")
+            {
+                Console.WriteLine("[MANUAL] A forçar envio do lote...");
+                ForwardBatchToServer();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[COMMAND] Erro: {ex.Message}");
         }
     }
 }
 
 void UpdateSensorEntry(string id, string estado)
 {
-    var lines = File.ReadAllLines(CSV_FILE).ToList();
-    for (int i = 1; i < lines.Count; i++)
+    lock (lockCsv)
     {
-        var p = lines[i].Split(';');
-        if (p[0].Trim().Equals(id, StringComparison.OrdinalIgnoreCase))
+        try
         {
-            p[1] = estado;
-            p[4] = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
-            lines[i] = string.Join(';', p);
-            break;
+            var lines = File.ReadAllLines(CSV_FILE).ToList();
+            for (int i = 1; i < lines.Count; i++)
+            {
+                var p = lines[i].Split(';');
+                if (p[0].Trim().Equals(id, StringComparison.OrdinalIgnoreCase))
+                {
+                    p[1] = estado;
+                    p[4] = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+                    lines[i] = string.Join(';', p);
+                    break;
+                }
+            }
+            File.WriteAllLines(CSV_FILE, lines);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[CSV] Erro ao atualizar: {ex.Message}");
         }
     }
-    File.WriteAllLines(CSV_FILE, lines);
 }
 
 void LogDataLocally(string data)
 {
-    File.AppendAllText(HISTORY_FILE, $"[{DateTime.Now}] {data}{Environment.NewLine}");
+    try
+    {
+        File.AppendAllText(HISTORY_FILE, $"[{DateTime.Now}] {data}{Environment.NewLine}");
+    }
+    catch { }
 }
 
 SensorInfo? FindSensor(string sensorId)
 {
-    if (!File.Exists(CSV_FILE)) return null;
-    var lines = File.ReadAllLines(CSV_FILE).Skip(1);
-    foreach (var line in lines)
+    try
     {
-        var p = line.Split(';');
-        if (p.Length >= 5 && p[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
+        if (!File.Exists(CSV_FILE)) return null;
+        var lines = File.ReadAllLines(CSV_FILE).Skip(1);
+        foreach (var line in lines)
         {
-            return new SensorInfo
+            var p = line.Split(';');
+            if (p.Length >= 5 && p[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
             {
-                SensorId = p[0].Trim(),
-                Estado = p[1].Trim().ToLower(),
-                Zona = p[2].Trim(),
-                TiposDados = p[3].Split(',').Select(t => t.Trim()).ToList()
-            };
+                return new SensorInfo
+                {
+                    SensorId = p[0].Trim(),
+                    Estado = p[1].Trim().ToLower(),
+                    Zona = p[2].Trim(),
+                    TiposDados = p[3].Split(',').Select(t => t.Trim()).ToList()
+                };
+            }
         }
     }
+    catch { }
     return null;
 }
 
