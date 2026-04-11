@@ -183,6 +183,66 @@ void HandleSensor(object? clientObj)
                         }
                         break;
 
+                    case "LOTE":
+                        if (isConnected && currentSensorId != null && parts.Length >= 4)
+                        {
+                            try
+                            {
+                                int qtd = int.Parse(parts[2]);
+                                string medicoesBrutas = string.Join("|", parts.Skip(3)); // Recriar dados em caso de split extra
+                                var medicoes = medicoesBrutas.Split('#');
+
+                                Console.WriteLine($"[LOTE] Sensor {currentSensorId} enviou {qtd} medições");
+
+                                foreach (var med in medicoes)
+                                {
+                                    if (string.IsNullOrWhiteSpace(med)) continue;
+
+                                    var medPartes = med.Split('|');
+                                    if (medPartes.Length >= 2)
+                                    {
+                                        string tipo = medPartes[0].Trim();
+                                        
+                                        if (currentTipos.Contains(tipo))
+                                        {
+                                            LogDataLocally($"DATA|{currentSensorId}|{medPartes[2]}|{tipo}|{medPartes[1]}");
+
+                                            lock (lockBuffer)
+                                            {
+                                                _dataBuffer.Add($"DATA|{currentSensorId}|{medPartes[2]}|{tipo}|{medPartes[1]}");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                UpdateSensorEntry(currentSensorId, "ativo");
+                                writer.WriteLine("LOTE_ACK|SUCESSO");
+                                writer.Flush();
+                                Console.WriteLine($"[LOTE] ✓ Lote processado com sucesso");
+
+                                // Verificar se precisa enviar ao servidor
+                                lock (lockBuffer)
+                                {
+                                    if (_dataBuffer.Count >= MAX_BATCH_SIZE)
+                                    {
+                                        Thread envioThread = new Thread(ForwardBatchToServer)
+                                        {
+                                            Name = $"EnvioBatch-{DateTime.Now:HHmmss}",
+                                            IsBackground = true
+                                        };
+                                        envioThread.Start();
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"[LOTE] ✗ Erro ao processar lote: {ex.Message}");
+                                writer.WriteLine("LOTE_ACK|ERRO");
+                                writer.Flush();
+                            }
+                        }
+                        break;
+
                     case "HEARTBEAT":
                         if (isConnected && currentSensorId != null)
                         {
