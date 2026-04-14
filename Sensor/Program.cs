@@ -882,3 +882,4 @@ class SensorConfiguracao
     public string Zona { get; set; } = "";
     public string TiposDados { get; set; } = "";
 }
+//
