@@ -1,0 +1,3 @@
+sensor_id=S105
+zona=ZONA_ESCOLAR
+tipos_dados=TEMP,HUM,RUIDO

@@ -1,0 +1,3 @@
+sensor_id=S102
+zona=ZONA_ESCOLAR
+tipos_dados=TEMP,PM2.5,RUIDO

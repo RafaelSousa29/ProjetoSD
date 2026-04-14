@@ -1,21 +1,18 @@
-﻿using System;
 using System.Collections.Concurrent;
-using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
 const int PORT = 6000;
 const string DB_CONNECTION_STRING = "Data Source=OneHealth.db";
 
-ConcurrentDictionary<string, Mutex> fileMutexes = new ConcurrentDictionary<string, Mutex>();
+ConcurrentDictionary<string, Mutex> fileMutexes = new(StringComparer.OrdinalIgnoreCase);
+SemaphoreSlim databaseLock = new(1, 1);
 
 InitializeDatabase();
 
-TcpListener listener = new TcpListener(IPAddress.Any, PORT);
+TcpListener listener = new(IPAddress.Any, PORT);
 listener.Start();
 
 Console.WriteLine($"[SERVIDOR] À escuta na porta {PORT}...");
@@ -30,44 +27,70 @@ while (true)
 async Task HandleGatewayAsync(TcpClient client)
 {
     using (client)
-    using (NetworkStream stream = client.GetStream())
-    using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
-    using (StreamWriter writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true })
     {
+        using NetworkStream stream = client.GetStream();
+        using StreamReader reader = new(stream, Encoding.UTF8);
+        using StreamWriter writer = new(stream, Encoding.UTF8) { AutoFlush = true };
+
         try
         {
             while (true)
             {
                 string? line = await reader.ReadLineAsync();
-                if (line == null) break;
+                if (line == null)
+                {
+                    break;
+                }
 
                 Console.WriteLine($"[SERVIDOR] Recebido: {line}");
 
-                if (line.StartsWith("DATA_BATCH"))
+                if (!line.StartsWith("DATA_BATCH|", StringComparison.OrdinalIgnoreCase))
                 {
-                    string[] mainParts = line.Split('|', 4);
-                    if (mainParts.Length >= 4)
+                    await writer.WriteLineAsync("SERVER_ACK|ERRO|COMANDO_DESCONHECIDO");
+                    continue;
+                }
+
+                string[] mainParts = line.Split('|', 4);
+                if (mainParts.Length < 4 || !int.TryParse(mainParts[2], out int expectedCount))
+                {
+                    await writer.WriteLineAsync("LOTE_ACK|ERRO|FORMATO_INVALIDO");
+                    continue;
+                }
+
+                string gatewayId = mainParts[1].Trim();
+                string[] medicoes = mainParts[3]
+                    .Split('#', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                if (medicoes.Length != expectedCount)
+                {
+                    await writer.WriteLineAsync("LOTE_ACK|ERRO|CONTAGEM_INVALIDA");
+                    continue;
+                }
+
+                bool success = true;
+
+                foreach (string medicao in medicoes)
+                {
+                    string[] p = medicao.Split('|');
+                    if (p.Length < 5 || !p[0].Equals("DATA", StringComparison.OrdinalIgnoreCase))
                     {
-                        string gatewayId = mainParts[1].Trim();
-                        string[] medicoes = mainParts[3].Split('#');
-
-                        foreach (var medicao in medicoes)
-                        {
-                            if (string.IsNullOrWhiteSpace(medicao)) continue;
-
-                            string[] p = medicao.Split('|');
-                            if (p.Length >= 5 && p[0] == "DATA")
-                            {
-                                GravarDados(gatewayId, p[1], p[2], p[3], p[4]);
-                            }
-                        }
+                        success = false;
+                        break;
                     }
-                    await writer.WriteLineAsync("LOTE_ACK|SUCESSO");
+
+                    try
+                    {
+                        await GravarDadosAsync(gatewayId, p[1], p[2], p[3], p[4]);
+                    }
+                    catch (Exception ex)
+                    {
+                        success = false;
+                        Console.WriteLine($"[SERVIDOR] Erro ao gravar medição: {ex.Message}");
+                        break;
+                    }
                 }
-                else
-                {
-                    await writer.WriteLineAsync("SERVER_ACK|SUCESSO");
-                }
+
+                await writer.WriteLineAsync(success ? "LOTE_ACK|SUCESSO" : "LOTE_ACK|ERRO|PROCESSAMENTO");
             }
         }
         catch (Exception ex)
@@ -75,69 +98,69 @@ async Task HandleGatewayAsync(TcpClient client)
             Console.WriteLine($"[SERVIDOR] Erro: {ex.Message}");
         }
     }
+
     Console.WriteLine("[SERVIDOR] Gateway desligado.");
 }
 
-void GravarDados(string gatewayId, string sensorId, string timestamp, string tipoDado, string valor)
+async Task GravarDadosAsync(string gatewayId, string sensorId, string timestamp, string tipoDado, string valor)
 {
-    tipoDado = tipoDado.ToUpper();
-
-    string fileName = $"{tipoDado}.txt";
-    Mutex fileMutex = fileMutexes.GetOrAdd(fileName, new Mutex());
+    string normalizedType = tipoDado.Trim().ToUpperInvariant();
+    string fileName = $"{normalizedType}.txt";
+    Mutex fileMutex = fileMutexes.GetOrAdd(fileName, _ => new Mutex());
 
     fileMutex.WaitOne();
     try
     {
         string logEntry = $"{timestamp} | Gateway: {gatewayId} | Sensor: {sensorId} | Valor: {valor}";
         File.AppendAllText(fileName, logEntry + Environment.NewLine);
-        Console.WriteLine($"[DEBUG] Ficheiro {fileName} atualizado em: {Path.GetFullPath(fileName)}");
+        Console.WriteLine($"[FICHEIRO] {fileName} atualizado.");
     }
     finally
     {
         fileMutex.ReleaseMutex();
     }
 
+    await databaseLock.WaitAsync();
     try
     {
-        using (var connection = new SqliteConnection(DB_CONNECTION_STRING))
-        {
-            connection.Open();
-            var command = connection.CreateCommand();
-            command.CommandText = @"
-                INSERT INTO Medicoes (GatewayId, SensorId, TipoDado, Valor, Timestamp)
-                VALUES ($gatewayId, $sensorId, $tipoDado, $valor, $timestamp)";
+        using SqliteConnection connection = new(DB_CONNECTION_STRING);
+        connection.Open();
 
-            command.Parameters.AddWithValue("$gatewayId", gatewayId);
-            command.Parameters.AddWithValue("$sensorId", sensorId);
-            command.Parameters.AddWithValue("$tipoDado", tipoDado);
-            command.Parameters.AddWithValue("$valor", valor);
-            command.Parameters.AddWithValue("$timestamp", timestamp);
+        using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = @"
+            INSERT INTO Medicoes (GatewayId, SensorId, TipoDado, Valor, Timestamp)
+            VALUES ($gatewayId, $sensorId, $tipoDado, $valor, $timestamp)";
 
-            command.ExecuteNonQuery();
-        }
+        command.Parameters.AddWithValue("$gatewayId", gatewayId.Trim());
+        command.Parameters.AddWithValue("$sensorId", sensorId.Trim());
+        command.Parameters.AddWithValue("$tipoDado", normalizedType);
+        command.Parameters.AddWithValue("$valor", valor.Trim());
+        command.Parameters.AddWithValue("$timestamp", timestamp.Trim());
+
+        command.ExecuteNonQuery();
     }
-    catch (Exception ex)
+    finally
     {
-        Console.WriteLine($"[SERVIDOR] Erro na BD: {ex.Message}");
+        databaseLock.Release();
     }
 }
 
 void InitializeDatabase()
 {
-    using (var connection = new SqliteConnection(DB_CONNECTION_STRING))
-    {
-        connection.Open();
-        var command = connection.CreateCommand();
-        command.CommandText = @"
-            CREATE TABLE IF NOT EXISTS Medicoes (
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                GatewayId TEXT,
-                SensorId TEXT,
-                TipoDado TEXT,
-                Valor TEXT,
-                Timestamp TEXT
-            )";
-        command.ExecuteNonQuery();
-    }
-    Console.WriteLine("[SERVIDOR] Base de Dados Pronta e Mutexes Ativos.");
+    using SqliteConnection connection = new(DB_CONNECTION_STRING);
+    connection.Open();
+
+    using SqliteCommand command = connection.CreateCommand();
+    command.CommandText = @"
+        CREATE TABLE IF NOT EXISTS Medicoes (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            GatewayId TEXT NOT NULL,
+            SensorId TEXT NOT NULL,
+            TipoDado TEXT NOT NULL,
+            Valor TEXT NOT NULL,
+            Timestamp TEXT NOT NULL
+        )";
+    command.ExecuteNonQuery();
+
+    Console.WriteLine("[SERVIDOR] Base de dados pronta.");
 }

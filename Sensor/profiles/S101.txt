@@ -1,0 +1,3 @@
+sensor_id=S101
+zona=ZONA_PARQUE
+tipos_dados=TEMP,HUM,RUIDO
