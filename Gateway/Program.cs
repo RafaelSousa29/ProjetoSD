@@ -10,10 +10,12 @@ const string GATEWAY_ID = "GW01";
 const string CSV_FILE = "sensors.csv";
 const string HISTORY_FILE = "gateway_history.txt";
 const string SENSOR_PROFILES_RELATIVE_PATH = "..\\Sensor\\profiles";
+const string VIDEO_STREAMS_FOLDER = "video_streams";
 const int MAX_BATCH_SIZE = 20;
 const int BATCH_TIMEOUT_MS = 300000;
 const int SENSOR_TIMEOUT_MS = 30000;
 const int MONITOR_INTERVAL_MS = 5000;
+const int DEFAULT_VIDEO_FRAME_COUNT = 10;
 const string STATE_ACTIVE = "ativo";
 const string STATE_MAINTENANCE = "manutencao";
 const string STATE_DISABLED = "desativado";
@@ -29,6 +31,7 @@ SemaphoreSlim batchSendLock = new(1, 1);
 ConcurrentDictionary<string, DateTime> lastSeenUtc = new(StringComparer.OrdinalIgnoreCase);
 ConcurrentDictionary<string, int> heartbeatCounters = new(StringComparer.OrdinalIgnoreCase);
 ConcurrentDictionary<string, string> sensorStatusReasons = new(StringComparer.OrdinalIgnoreCase);
+ConcurrentDictionary<string, SensorSession> activeSessions = new(StringComparer.OrdinalIgnoreCase);
 
 EnsureCsvExists();
 LoadPendingBuffer();
@@ -37,7 +40,7 @@ TcpListener listener = new(IPAddress.Any, GATEWAY_PORT);
 listener.Start();
 
 Console.WriteLine($"[GATEWAY {GATEWAY_ID}] Ativo na porta {GATEWAY_PORT}...");
-Console.WriteLine("Comandos disponíveis: 'send' para forçar envio do lote, 'status' para listar sensores, 'create' para criar um novo sensor e 'state' para alterar o estado.");
+Console.WriteLine("Comandos disponíveis: 'send', 'status', 'create', 'state' e 'video'.");
 
 _ = Task.Run(BatchTimerLoop);
 _ = Task.Run(ManualCommandLoop);
@@ -71,6 +74,7 @@ async Task HandleSensorAsync(TcpClient client)
                     if (currentSensorId != null)
                     {
                         MarkSensorAsInactive(currentSensorId);
+                        activeSessions.TryRemove(currentSensorId, out _);
                     }
                     break;
                 }
@@ -97,24 +101,14 @@ async Task HandleSensorAsync(TcpClient client)
                         string tiposSolicitadosRaw = parts[2];
                         string zona = parts[3].Trim();
                         SensorInfo? info = FindSensor(id);
-
-                        if (info == null)
+                        string? connectValidationError = ValidateSensorConnection(info, zona);
+                        if (connectValidationError != null)
                         {
-                            await writer.WriteLineAsync("CONN_ACK|RECUSADO|ID_DESCONHECIDO");
+                            await writer.WriteLineAsync(connectValidationError);
                             break;
                         }
 
-                        if (info.Estado == STATE_DISABLED)
-                        {
-                            await writer.WriteLineAsync("CONN_ACK|RECUSADO|SENSOR_DESATIVADO");
-                            break;
-                        }
-
-                        if (!info.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
-                        {
-                            await writer.WriteLineAsync("CONN_ACK|RECUSADO|ZONA_INVALIDA");
-                            break;
-                        }
+                        SensorInfo validatedInfo = info!;
 
                         List<string> tiposSolicitados = tiposSolicitadosRaw
                             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
@@ -127,7 +121,7 @@ async Task HandleSensorAsync(TcpClient client)
                         }
 
                         bool todosOsTiposSaoValidos = tiposSolicitados.All(ts =>
-                            info.TiposDados.Any(csvT => csvT.Equals(ts, StringComparison.OrdinalIgnoreCase)));
+                            validatedInfo.TiposDados.Any(csvT => csvT.Equals(ts, StringComparison.OrdinalIgnoreCase)));
 
                         if (!todosOsTiposSaoValidos)
                         {
@@ -139,14 +133,14 @@ async Task HandleSensorAsync(TcpClient client)
                         currentSensorId = id;
                         currentTipos = new HashSet<string>(tiposSolicitados, StringComparer.OrdinalIgnoreCase);
                         isConnected = true;
-                        RegisterSensorSeen(id);
-                        sensorStatusReasons[id] = info.Estado == STATE_MAINTENANCE ? "Manutenção em curso." : "Ligação aceite.";
-                        UpdateSensorEntry(id, info.Estado, DateTime.UtcNow);
+                        MarkSensorAsSeen(id, validatedInfo.Estado == STATE_MAINTENANCE ? "Manutenção em curso." : "Ligação aceite.");
+                        UpdateSensorEntry(id, validatedInfo.Estado, DateTime.UtcNow);
 
-                        string response = info.Estado == STATE_MAINTENANCE
+                        string response = validatedInfo.Estado == STATE_MAINTENANCE
                             ? "CONN_ACK|MANUTENCAO"
                             : "CONN_ACK|ACEITE";
 
+                        activeSessions[id] = new SensorSession(id, writer);
                         await writer.WriteLineAsync(response);
                         Console.WriteLine($"[ACEITE] Sensor {id} conectado na zona {zona}. Tipos: {string.Join(", ", currentTipos)}");
                         break;
@@ -205,7 +199,7 @@ async Task HandleSensorAsync(TcpClient client)
                             break;
                         }
 
-                        RegisterSensorSeen(currentSensorId);
+                        MarkSensorAsSeen(currentSensorId, "Heartbeat recebido.");
                         UpdateSensorEntry(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
                         int heartbeatCount = heartbeatCounters.AddOrUpdate(currentSensorId, 1, (_, current) => current + 1);
                         if (heartbeatCount % 10 == 0)
@@ -231,7 +225,7 @@ async Task HandleSensorAsync(TcpClient client)
                         string notificationType = parts[2].Trim().ToUpperInvariant();
                         string notificationPayload = parts[3].Trim();
 
-                        RegisterSensorSeen(currentSensorId);
+                        MarkSensorAsSeen(currentSensorId, $"Notificação {notificationType} recebida.");
 
                         if (notificationType == "LOW_BATTERY")
                         {
@@ -262,6 +256,21 @@ async Task HandleSensorAsync(TcpClient client)
                         }
                         break;
 
+                    case "VIDEO_ACK":
+                        if (!isConnected || currentSensorId == null)
+                        {
+                            break;
+                        }
+
+                        if (activeSessions.TryGetValue(currentSensorId, out SensorSession? videoSession))
+                        {
+                            string payload = parts.Length >= 3
+                                ? string.Join('|', parts.Skip(2))
+                                : "ERRO|SEM_PAYLOAD";
+                            videoSession.TryCompleteVideoAck(payload);
+                        }
+                        break;
+
                     case "DISCONNECT":
                         if (!isConnected || currentSensorId == null)
                         {
@@ -272,6 +281,7 @@ async Task HandleSensorAsync(TcpClient client)
                         UpdateSensorEntry(currentSensorId, STATE_INACTIVE, DateTime.UtcNow);
                         lastSeenUtc.TryRemove(currentSensorId, out _);
                         heartbeatCounters.TryRemove(currentSensorId, out _);
+                        activeSessions.TryRemove(currentSensorId, out _);
                         sensorStatusReasons[currentSensorId] = "Ligação terminada pelo sensor.";
                         Console.WriteLine($"[DESLIGAR] Sensor {currentSensorId} terminou a ligação.");
                         await writer.WriteLineAsync("ACK_DISCONNECT|SUCESSO");
@@ -288,6 +298,7 @@ async Task HandleSensorAsync(TcpClient client)
             if (currentSensorId != null)
             {
                 MarkSensorAsInactive(currentSensorId);
+                activeSessions.TryRemove(currentSensorId, out _);
             }
 
             Console.WriteLine($"[GATEWAY] Erro na ligação: {ex.Message}");
@@ -331,8 +342,6 @@ async Task ForwardBatchToServerAsync()
             batch = dataBuffer.Take(countToSend).ToList();
         }
 
-        string msg = $"DATA_BATCH|{GATEWAY_ID}|{batch.Count}|{string.Join("#", batch)}";
-
         try
         {
             using TcpClient server = new();
@@ -342,10 +351,16 @@ async Task ForwardBatchToServerAsync()
             using StreamWriter sw = new(stream, Encoding.UTF8) { AutoFlush = true };
             using StreamReader sr = new(stream, Encoding.UTF8);
 
-            await sw.WriteLineAsync(msg);
+            await sw.WriteLineAsync($"DATA_BATCH|{GATEWAY_ID}|{batch.Count}");
+            foreach (string measurement in batch)
+            {
+                await sw.WriteLineAsync(measurement);
+            }
+            await sw.WriteLineAsync("END");
+
             string? ack = await sr.ReadLineAsync();
 
-            if (ack != "LOTE_ACK|SUCESSO")
+            if (ack != "BATCH_ACK|SUCESSO")
             {
                 Console.WriteLine($"[ERRO] ACK inesperado do servidor: {ack ?? "<null>"}");
                 return;
@@ -420,7 +435,126 @@ async Task ManualCommandLoop()
         {
             ChangeSensorStateInteractive();
         }
+        else if (cmd == "video")
+        {
+            await RequestVideoInteractiveAsync();
+        }
     }
+}
+
+async Task RequestVideoInteractiveAsync()
+{
+    Console.Write("ID do sensor para vídeo: ");
+    string sensorId = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+
+    if (string.IsNullOrWhiteSpace(sensorId))
+    {
+        Console.WriteLine("[VIDEO] ID inválido.");
+        return;
+    }
+
+    SensorInfo? sensor = FindSensor(sensorId);
+    if (sensor == null)
+    {
+        Console.WriteLine($"[VIDEO] Sensor {sensorId} não encontrado.");
+        return;
+    }
+
+    if (sensor.Estado != STATE_ACTIVE)
+    {
+        Console.WriteLine($"[VIDEO] O sensor {sensorId} não está ativo.");
+        return;
+    }
+
+    if (!activeSessions.TryGetValue(sensorId, out SensorSession? session))
+    {
+        Console.WriteLine($"[VIDEO] O sensor {sensorId} não está ligado ao gateway.");
+        return;
+    }
+
+    Console.Write($"Número de frames simulados (Enter para {DEFAULT_VIDEO_FRAME_COUNT}): ");
+    string? input = Console.ReadLine()?.Trim();
+    int frameCount = DEFAULT_VIDEO_FRAME_COUNT;
+    if (!string.IsNullOrWhiteSpace(input) && (!int.TryParse(input, out frameCount) || frameCount <= 0))
+    {
+        Console.WriteLine("[VIDEO] Número de frames inválido.");
+        return;
+    }
+
+    Directory.CreateDirectory(Path.Combine(Environment.CurrentDirectory, VIDEO_STREAMS_FOLDER));
+
+    using TcpListener videoListener = new(IPAddress.Any, 0);
+    videoListener.Start();
+
+    int videoPort = ((IPEndPoint)videoListener.LocalEndpoint).Port;
+    TaskCompletionSource<string> videoAck = session.CreatePendingVideoAck();
+
+    try
+    {
+        await session.SendAsync($"VIDEO_REQ|{sensorId}|{videoPort}|{frameCount}");
+        string ackPayload = await videoAck.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        if (!ackPayload.StartsWith("ACEITE|", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[VIDEO] Pedido recusado pelo sensor {sensorId}: {ackPayload}");
+            return;
+        }
+
+        Console.WriteLine($"[VIDEO] Sensor {sensorId} aceitou o pedido. A receber stream na porta {videoPort}...");
+        using TcpClient videoClient = await videoListener.AcceptTcpClientAsync().WaitAsync(TimeSpan.FromSeconds(15));
+        string savedPath = await ReceiveVideoStreamAsync(sensorId, videoClient);
+        Console.WriteLine($"[VIDEO] Stream guardada em {savedPath}");
+    }
+    catch (TimeoutException)
+    {
+        Console.WriteLine($"[VIDEO] Timeout à espera da resposta ou da stream do sensor {sensorId}.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[VIDEO] Erro na sessão de vídeo: {ex.Message}");
+    }
+    finally
+    {
+        session.ClearPendingVideoAck(videoAck);
+    }
+}
+
+async Task<string> ReceiveVideoStreamAsync(string sensorId, TcpClient videoClient)
+{
+    using NetworkStream stream = videoClient.GetStream();
+    using StreamReader reader = new(stream, Encoding.UTF8);
+
+    string sensorDirectory = Path.Combine(Environment.CurrentDirectory, VIDEO_STREAMS_FOLDER, sensorId);
+    Directory.CreateDirectory(sensorDirectory);
+
+    string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+    string filePath = Path.Combine(sensorDirectory, $"{timestamp}.txt");
+    List<string> lines = new();
+    int frameCounter = 0;
+
+    while (true)
+    {
+        string? line = await reader.ReadLineAsync();
+        if (line == null)
+        {
+            break;
+        }
+
+        lines.Add(line);
+        if (line.StartsWith("VIDEO_FRAME|", StringComparison.OrdinalIgnoreCase))
+        {
+            frameCounter++;
+        }
+
+        if (line.StartsWith("VIDEO_END|", StringComparison.OrdinalIgnoreCase))
+        {
+            break;
+        }
+    }
+
+    File.WriteAllLines(filePath, lines);
+    LogDataLocally($"VIDEO|{sensorId}|{timestamp}|{frameCounter}_frames|{Path.GetFileName(filePath)}");
+    return filePath;
 }
 
 async Task MonitorSensorsLoop()
@@ -475,6 +609,32 @@ void MarkSensorAsInactive(string sensorId)
     heartbeatCounters.TryRemove(sensorId, out _);
     sensorStatusReasons[sensorId] = "Ligação perdida.";
     UpdateSensorEntry(sensorId, STATE_INACTIVE, DateTime.UtcNow);
+}
+
+string? ValidateSensorConnection(SensorInfo? info, string zona)
+{
+    if (info == null)
+    {
+        return "CONN_ACK|RECUSADO|ID_DESCONHECIDO";
+    }
+
+    if (info.Estado == STATE_DISABLED)
+    {
+        return "CONN_ACK|RECUSADO|SENSOR_DESATIVADO";
+    }
+
+    if (!info.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
+    {
+        return "CONN_ACK|RECUSADO|ZONA_INVALIDA";
+    }
+
+    return null;
+}
+
+void MarkSensorAsSeen(string sensorId, string reason)
+{
+    RegisterSensorSeen(sensorId);
+    sensorStatusReasons[sensorId] = reason;
 }
 
 void UpdateSensorEntry(string id, string estado, DateTime timestampUtc)
@@ -781,4 +941,54 @@ class SensorInfo
     public string Zona { get; set; } = "";
     public List<string> TiposDados { get; set; } = new();
     public string LastSync { get; set; } = "-";
+}
+
+class SensorSession
+{
+    private readonly StreamWriter writer;
+    private TaskCompletionSource<string>? pendingVideoAck;
+
+    public SensorSession(string sensorId, StreamWriter writer)
+    {
+        SensorId = sensorId;
+        this.writer = writer;
+    }
+
+    public string SensorId { get; }
+    public SemaphoreSlim WriteLock { get; } = new(1, 1);
+
+    public async Task SendAsync(string message)
+    {
+        await WriteLock.WaitAsync();
+        try
+        {
+            await writer.WriteLineAsync(message);
+        }
+        finally
+        {
+            WriteLock.Release();
+        }
+    }
+
+    public TaskCompletionSource<string> CreatePendingVideoAck()
+    {
+        TaskCompletionSource<string> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref pendingVideoAck, tcs);
+        return tcs;
+    }
+
+    public void TryCompleteVideoAck(string payload)
+    {
+        TaskCompletionSource<string>? current = Interlocked.Exchange(ref pendingVideoAck, null);
+        current?.TrySetResult(payload);
+    }
+
+    public void ClearPendingVideoAck(TaskCompletionSource<string> expected)
+    {
+        TaskCompletionSource<string>? current = Interlocked.CompareExchange(ref pendingVideoAck, null, expected);
+        if (current == expected)
+        {
+            expected.TrySetCanceled();
+        }
+    }
 }

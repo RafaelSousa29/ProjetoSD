@@ -1,0 +1,5 @@
+2026-04-14T22:24:38 | Gateway: GW01 | Sensor: S102 | Valor: 38
+2026-04-14T22:24:59 | Gateway: GW01 | Sensor: S102 | Valor: 63
+2026-04-14T22:25:01 | Gateway: GW01 | Sensor: S101 | Valor: 50
+2026-04-14T22:25:19 | Gateway: GW01 | Sensor: S102 | Valor: 73
+2026-04-14T22:25:21 | Gateway: GW01 | Sensor: S101 | Valor: 73

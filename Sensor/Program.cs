@@ -1,4 +1,5 @@
 using DataGenerator;
+using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -9,6 +10,8 @@ const int HEARTBEAT_INTERVAL_MS = 10000;
 const int BATTERY_DRAIN_INTERVAL_MS = 45000;
 const int BATTERY_CHARGE_INTERVAL_MS = 5000;
 const int LOW_BATTERY_THRESHOLD = 20;
+const int VIDEO_STREAM_BATTERY_COST = 5;
+const int VIDEO_STREAM_FRAME_DELAY_MS = 500;
 const int HEARTBEAT_BATTERY_COST = 1;
 const int DATA_BATTERY_COST = 3;
 const int IDLE_BATTERY_COST = 1;
@@ -45,13 +48,20 @@ int batteryLevel = 100;
 int autoSendIntervalSeconds = 60;
 int autoSendCycleCount = 0;
 Task? chargingTask = null;
+Task? heartbeatTask = null;
+Task? receiveLoopTask = null;
 DateTime nextAutoSendUtc = DateTime.MaxValue;
 string maintenanceReason = REASON_OK;
 
 Lock batteryLock = new();
 Lock autoSendLock = new();
+Lock heartbeatTaskLock = new();
+Lock videoStateLock = new();
 SemaphoreSlim socketLock = new(1, 1);
 SemaphoreSlim autoSendRoundLock = new(1, 1);
+SemaphoreSlim responseSignal = new(0);
+ConcurrentQueue<string> responseQueue = new();
+bool videoStreamActive = false;
 
 LoadSensorState();
 
@@ -63,11 +73,12 @@ try
     NetworkStream stream = client.GetStream();
     reader = new StreamReader(stream, Encoding.UTF8);
     writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+    receiveLoopTask = Task.Run(ReceiveLoopAsync);
 
     string connectMsg = $"CONNECT|{sensorId}|{tiposDados}|{zona}";
     await writer.WriteLineAsync(connectMsg);
 
-    string? response = await reader.ReadLineAsync();
+    string? response = await WaitForProtocolResponseAsync();
     Console.WriteLine($"[SENSOR] Resposta: {response}");
 
     if (response == "CONN_ACK|ACEITE")
@@ -85,7 +96,7 @@ try
         else
         {
             maintenanceReason = REASON_OK;
-            _ = Task.Run(HeartbeatLoop);
+            EnsureHeartbeatLoopRunning();
             if (restoreAutoSendOnStartup)
             {
                 SetAutoSendEnabled(true);
@@ -196,30 +207,21 @@ async Task EnviarMedicaoManual()
 
 async Task EnviarMedicaoAsync(string tipo, string valor, bool origemAutomatica)
 {
-    if (!ligado || writer == null || reader == null)
+    if (!CanUseConnection())
     {
         Console.WriteLine("O sensor não está ligado ao gateway.");
         return;
     }
 
-    if (aCarregar)
+    if (!CanSendMeasurement(origemAutomatica))
     {
-        Console.WriteLine("[SENSOR] Não é possível enviar medições enquanto a bateria está a carregar.");
-        return;
-    }
-
-    if (modoManutencao && !origemAutomatica)
-    {
-        Console.WriteLine("[SENSOR] O sensor está em manutenção.");
         return;
     }
 
     if (GetBatteryLevel() <= 0)
     {
         Console.WriteLine("[SENSOR] Bateria esgotada. Coloque o sensor a carregar.");
-        modoManutencao = true;
-        heartbeatAtivo = false;
-        SetAutoSendEnabled(false);
+        EnterMaintenance(REASON_LOW_BATTERY, preserveAutoSendPreference: true);
         return;
     }
 
@@ -239,7 +241,7 @@ async Task EnviarMedicaoAsync(string tipo, string valor, bool origemAutomatica)
         string dataMsg = $"DATA|{sensorId}|{timestamp}|{tipo}|{valor}";
         await writer.WriteLineAsync(dataMsg);
 
-        string? response = await reader.ReadLineAsync();
+        string? response = await WaitForProtocolResponseAsync();
         Console.WriteLine($"[SENSOR] Resposta: {response}");
 
         if (response == "DATA_ACK|SUCESSO")
@@ -328,7 +330,7 @@ async Task AutoSendLoop()
 
 Task IniciarCarregamento()
 {
-    if (!ligado || writer == null || reader == null)
+    if (!CanUseConnection())
     {
         Console.WriteLine("O sensor não está ligado ao gateway.");
         return Task.CompletedTask;
@@ -381,18 +383,13 @@ async Task ChargingLoop()
 
         if (completed)
         {
-            aCarregar = false;
-            modoManutencao = false;
-            lowBatteryAlertSent = false;
-            heartbeatAtivo = true;
-            maintenanceReason = REASON_OK;
+            RestoreActiveModeAfterCharging();
             bool restoreAutoSend = resumeAutoSendAfterCharging;
             resumeAutoSendAfterCharging = false;
-            SaveSensorState();
 
             Console.WriteLine("[SENSOR] Carregamento concluído. Sensor novamente ativo.");
             _ = Task.Run(() => TrySendNotificationAsync("CHARGING", "COMPLETO"));
-            _ = Task.Run(HeartbeatLoop);
+            EnsureHeartbeatLoopRunning();
             if (restoreAutoSend)
             {
                 SetAutoSendEnabled(true);
@@ -419,11 +416,7 @@ async Task HeartbeatLoop()
 
             if (GetBatteryLevel() <= 0)
             {
-                heartbeatAtivo = false;
-                modoManutencao = true;
-                RememberAutoSendPreference();
-                SetAutoSendEnabled(false);
-                ClearNextAutoSend();
+                EnterMaintenance(REASON_LOW_BATTERY, preserveAutoSendPreference: true);
                 Console.WriteLine("[SENSOR] Heartbeat parado por bateria esgotada.");
                 continue;
             }
@@ -437,7 +430,7 @@ async Task HeartbeatLoop()
                 string hbMsg = $"HEARTBEAT|{sensorId}|{timestamp}";
                 await writer.WriteLineAsync(hbMsg);
 
-                string? response = await reader.ReadLineAsync();
+                string? response = await WaitForProtocolResponseAsync();
                 heartbeatCount++;
 
                 if (response == null || !response.StartsWith("ACK_HEARTBEAT|SUCESSO", StringComparison.OrdinalIgnoreCase))
@@ -469,7 +462,209 @@ async Task HeartbeatLoop()
         catch (Exception ex)
         {
             Console.WriteLine($"[SENSOR] Erro no heartbeat: {ex.Message}");
-            break;
+
+            if (!ligado || !heartbeatAtivo)
+            {
+                break;
+            }
+
+            await Task.Delay(1000);
+        }
+    }
+}
+
+async Task ReceiveLoopAsync()
+{
+    try
+    {
+        while (reader != null)
+        {
+            string? line = await reader.ReadLineAsync();
+            if (line == null)
+            {
+                break;
+            }
+
+            if (line.StartsWith("VIDEO_REQ|", StringComparison.OrdinalIgnoreCase))
+            {
+                _ = Task.Run(() => HandleVideoRequestAsync(line));
+                continue;
+            }
+
+            responseQueue.Enqueue(line);
+            responseSignal.Release();
+        }
+    }
+    catch (ObjectDisposedException)
+    {
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SENSOR] Erro na receção: {ex.Message}");
+    }
+    finally
+    {
+        ligado = false;
+        responseQueue.Enqueue("ERROR|LIGACAO_FECHADA");
+        responseSignal.Release();
+    }
+}
+
+async Task<string?> WaitForProtocolResponseAsync(int timeoutSeconds = 15)
+{
+    bool received = await responseSignal.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds));
+    if (!received)
+    {
+        return null;
+    }
+
+    return responseQueue.TryDequeue(out string? response)
+        ? response
+        : null;
+}
+
+async Task HandleVideoRequestAsync(string requestLine)
+{
+    string[] parts = requestLine.Split('|');
+    if (parts.Length < 4)
+    {
+        await SendVideoAckAsync("RECUSADO|FORMATO_INVALIDO");
+        return;
+    }
+
+    string requestedSensorId = parts[1].Trim();
+    bool portValid = int.TryParse(parts[2], out int streamPort);
+    bool framesValid = int.TryParse(parts[3], out int frameCount);
+
+    if (!requestedSensorId.Equals(sensorId, StringComparison.OrdinalIgnoreCase) ||
+        !portValid ||
+        !framesValid ||
+        streamPort <= 0 ||
+        frameCount <= 0)
+    {
+        await SendVideoAckAsync("RECUSADO|PEDIDO_INVALIDO");
+        return;
+    }
+
+    lock (videoStateLock)
+    {
+        if (videoStreamActive)
+        {
+            _ = SendVideoAckAsync("RECUSADO|STREAM_OCUPADA");
+            return;
+        }
+
+        videoStreamActive = true;
+    }
+
+    if (!ligado || aCarregar || modoManutencao || GetBatteryLevel() <= LOW_BATTERY_THRESHOLD)
+    {
+        lock (videoStateLock)
+        {
+            videoStreamActive = false;
+        }
+
+        await SendVideoAckAsync("RECUSADO|SENSOR_INDISPONIVEL");
+        return;
+    }
+
+    await SendVideoAckAsync($"ACEITE|{streamPort}");
+    _ = Task.Run(() => StreamVideoAsync(streamPort, frameCount));
+}
+
+async Task SendVideoAckAsync(string payload)
+{
+    if (!CanUseConnection())
+    {
+        return;
+    }
+
+    await socketLock.WaitAsync();
+    try
+    {
+        await writer!.WriteLineAsync($"VIDEO_ACK|{sensorId}|{payload}");
+    }
+    finally
+    {
+        socketLock.Release();
+    }
+}
+
+async Task StreamVideoAsync(int streamPort, int frameCount)
+{
+    try
+    {
+        using TcpClient streamClient = new();
+        await streamClient.ConnectAsync(GATEWAY_IP, streamPort);
+
+        using NetworkStream stream = streamClient.GetStream();
+        using StreamWriter streamWriter = new(stream, Encoding.UTF8) { AutoFlush = true };
+
+        string startedAt = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+        await streamWriter.WriteLineAsync($"VIDEO_START|{sensorId}|{startedAt}|{frameCount}");
+
+        for (int i = 1; i <= frameCount; i++)
+        {
+            if (!ligado || aCarregar || modoManutencao)
+            {
+                break;
+            }
+
+            string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+            string frameId = $"FRAME_{i:D3}";
+            string payload = BuildSimulatedFramePayload(i);
+            await streamWriter.WriteLineAsync($"VIDEO_FRAME|{sensorId}|{timestamp}|{frameId}|{payload}");
+            await Task.Delay(VIDEO_STREAM_FRAME_DELAY_MS);
+        }
+
+        string endedAt = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+        await streamWriter.WriteLineAsync($"VIDEO_END|{sensorId}|{endedAt}");
+
+        ConsumeBattery(VIDEO_STREAM_BATTERY_COST);
+        SaveSensorState();
+        await CheckLowBatteryAsync();
+        Console.WriteLine($"[VIDEO] Stream simulada enviada com {frameCount} frames.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[VIDEO] Falha ao enviar stream: {ex.Message}");
+    }
+    finally
+    {
+        lock (videoStateLock)
+        {
+            videoStreamActive = false;
+        }
+    }
+}
+
+string BuildSimulatedFramePayload(int frameNumber)
+{
+    string temp = configuredDataTypes.Contains("TEMP", StringComparer.OrdinalIgnoreCase)
+        ? SensorDataGenerator.Generate("TEMP")
+        : "NA";
+    string hum = configuredDataTypes.Contains("HUM", StringComparer.OrdinalIgnoreCase)
+        ? SensorDataGenerator.Generate("HUM")
+        : "NA";
+    string ruido = configuredDataTypes.Contains("RUIDO", StringComparer.OrdinalIgnoreCase)
+        ? SensorDataGenerator.Generate("RUIDO")
+        : "NA";
+
+    return $"scene=SIMULADA;frame={frameNumber:D3};temp={temp};hum={hum};ruido={ruido}";
+}
+
+void EnsureHeartbeatLoopRunning()
+{
+    lock (heartbeatTaskLock)
+    {
+        if (!heartbeatAtivo)
+        {
+            heartbeatAtivo = true;
+        }
+
+        if (heartbeatTask == null || heartbeatTask.IsCompleted)
+        {
+            heartbeatTask = Task.Run(HeartbeatLoop);
         }
     }
 }
@@ -510,26 +705,14 @@ async Task CheckLowBatteryAsync()
     {
         if (currentBattery <= 0)
         {
-            modoManutencao = true;
-            heartbeatAtivo = false;
-            RememberAutoSendPreference();
-            SetAutoSendEnabled(false);
-            ClearNextAutoSend();
-            maintenanceReason = REASON_LOW_BATTERY;
-            SaveSensorState();
+            EnterMaintenance(REASON_LOW_BATTERY, preserveAutoSendPreference: true);
             Console.WriteLine("[SENSOR] Bateria esgotada. O sensor precisa de carregamento.");
         }
         return;
     }
 
-    modoManutencao = true;
-    heartbeatAtivo = false;
-    RememberAutoSendPreference();
-    SetAutoSendEnabled(false);
-    ClearNextAutoSend();
+    EnterMaintenance(REASON_LOW_BATTERY, preserveAutoSendPreference: true);
     lowBatteryAlertSent = true;
-    maintenanceReason = REASON_LOW_BATTERY;
-    SaveSensorState();
 
     Console.WriteLine($"[SENSOR] Bateria baixa ({currentBattery}%). A notificar o gateway.");
     await SendNotificationAsync("LOW_BATTERY", $"{currentBattery}%");
@@ -604,6 +787,54 @@ string GetDisplayedState()
     }
 
     return "ativo";
+}
+
+bool CanUseConnection()
+{
+    return ligado && writer != null && reader != null;
+}
+
+bool CanSendMeasurement(bool origemAutomatica)
+{
+    if (aCarregar)
+    {
+        Console.WriteLine("[SENSOR] Não é possível enviar medições enquanto a bateria está a carregar.");
+        return false;
+    }
+
+    if (modoManutencao && !origemAutomatica)
+    {
+        Console.WriteLine("[SENSOR] O sensor está em manutenção.");
+        return false;
+    }
+
+    return true;
+}
+
+void EnterMaintenance(string reason, bool preserveAutoSendPreference)
+{
+    modoManutencao = true;
+    heartbeatAtivo = false;
+    maintenanceReason = reason;
+
+    if (preserveAutoSendPreference)
+    {
+        RememberAutoSendPreference();
+    }
+
+    SetAutoSendEnabled(false);
+    ClearNextAutoSend();
+    SaveSensorState();
+}
+
+void RestoreActiveModeAfterCharging()
+{
+    aCarregar = false;
+    modoManutencao = false;
+    lowBatteryAlertSent = false;
+    heartbeatAtivo = true;
+    maintenanceReason = REASON_OK;
+    SaveSensorState();
 }
 
 bool ShouldRunAutoSendNow()
@@ -710,7 +941,7 @@ async Task SendNotificationAsync(string notificationType, string payload)
         string notifyMsg = $"NOTIFY|{sensorId}|{notificationType}|{payload}";
         await writer.WriteLineAsync(notifyMsg);
 
-        string? response = await reader.ReadLineAsync();
+        string? response = await WaitForProtocolResponseAsync();
         Console.WriteLine($"[SENSOR] Resposta: {response}");
     }
     finally
@@ -740,7 +971,7 @@ async Task TrySendNotificationAsync(string notificationType, string payload)
 
             string notifyMsg = $"NOTIFY|{sensorId}|{notificationType}|{payload}";
             await writer.WriteLineAsync(notifyMsg);
-            string? response = await reader.ReadLineAsync();
+            string? response = await WaitForProtocolResponseAsync();
             Console.WriteLine($"[SENSOR] Resposta: {response}");
         }
         finally
@@ -820,7 +1051,7 @@ async Task DesligarSensor()
                 Console.WriteLine($"[SENSOR] A enviar: {discMsg}");
                 await writer.WriteLineAsync(discMsg);
 
-                string? response = await reader.ReadLineAsync();
+                string? response = await WaitForProtocolResponseAsync();
                 Console.WriteLine($"[SENSOR] Resposta: {response}");
             }
             finally

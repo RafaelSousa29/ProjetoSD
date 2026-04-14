@@ -50,20 +50,37 @@ async Task HandleGatewayAsync(TcpClient client)
                     continue;
                 }
 
-                string[] mainParts = line.Split('|', 4);
-                if (mainParts.Length < 4 || !int.TryParse(mainParts[2], out int expectedCount))
+                string[] mainParts = line.Split('|', 3);
+                if (mainParts.Length < 3 || !int.TryParse(mainParts[2], out int expectedCount) || expectedCount < 0)
                 {
-                    await writer.WriteLineAsync("LOTE_ACK|ERRO|FORMATO_INVALIDO");
+                    await writer.WriteLineAsync("BATCH_ACK|ERRO|FORMATO_INVALIDO");
                     continue;
                 }
 
                 string gatewayId = mainParts[1].Trim();
-                string[] medicoes = mainParts[3]
-                    .Split('#', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                List<string> medicoes = new(expectedCount);
+                bool terminatorReceived = false;
 
-                if (medicoes.Length != expectedCount)
+                while (true)
                 {
-                    await writer.WriteLineAsync("LOTE_ACK|ERRO|CONTAGEM_INVALIDA");
+                    string? measurementLine = await reader.ReadLineAsync();
+                    if (measurementLine == null)
+                    {
+                        break;
+                    }
+
+                    if (measurementLine.Equals("END", StringComparison.OrdinalIgnoreCase))
+                    {
+                        terminatorReceived = true;
+                        break;
+                    }
+
+                    medicoes.Add(measurementLine);
+                }
+
+                if (!terminatorReceived || medicoes.Count != expectedCount)
+                {
+                    await writer.WriteLineAsync("BATCH_ACK|ERRO|CONTAGEM_INVALIDA");
                     continue;
                 }
 
@@ -103,7 +120,7 @@ async Task HandleGatewayAsync(TcpClient client)
                     }
                 }
 
-                await writer.WriteLineAsync(success ? "LOTE_ACK|SUCESSO" : "LOTE_ACK|ERRO|PROCESSAMENTO");
+                await writer.WriteLineAsync(success ? "BATCH_ACK|SUCESSO" : "BATCH_ACK|ERRO|PROCESSAMENTO");
             }
         }
         catch (Exception ex)

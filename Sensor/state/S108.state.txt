@@ -1,7 +1,7 @@
 sensor_id=S108
-battery_level=15
+battery_level=46
 auto_send_enabled=True
-auto_send_interval_seconds=5
-resume_auto_send_after_charging=True
-maintenance_reason=Bateria fraca
-updated_at=2026-04-14T18:45:47
+auto_send_interval_seconds=20
+resume_auto_send_after_charging=False
+maintenance_reason=Operacional
+updated_at=2026-04-14T20:08:41
