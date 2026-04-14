@@ -695,24 +695,37 @@ SensorConfig ReadConfigFromFile()
         Console.WriteLine($"{i + 1} - {Path.GetFileNameWithoutExtension(files[i])}");
     }
 
-    Console.Write("Escolhe o número do perfil ou escreve o caminho de um ficheiro: ");
-    string? selection = Console.ReadLine()?.Trim();
+    string selectedPath = "";
+    while (true)
+    {
+        Console.Write("Escolhe o número do perfil, escreve o ID do sensor ou o caminho de um ficheiro: ");
+        string? selection = Console.ReadLine()?.Trim();
 
-    string selectedPath;
-    if (int.TryParse(selection, out int selectedIndex) &&
-        selectedIndex >= 1 &&
-        selectedIndex <= files.Length)
-    {
-        selectedPath = files[selectedIndex - 1];
-    }
-    else if (!string.IsNullOrWhiteSpace(selection) && File.Exists(selection))
-    {
-        selectedPath = selection;
-    }
-    else
-    {
-        Console.WriteLine("[SENSOR] Seleção inválida. Vai ser usado o primeiro perfil disponível.");
-        selectedPath = files[0];
+        if (int.TryParse(selection, out int selectedIndex) &&
+            selectedIndex >= 1 &&
+            selectedIndex <= files.Length)
+        {
+            selectedPath = files[selectedIndex - 1];
+            break;
+        }
+
+        if (!string.IsNullOrWhiteSpace(selection))
+        {
+            string byIdPath = Path.Combine(profilesPath, $"{selection}.txt");
+            if (File.Exists(byIdPath))
+            {
+                selectedPath = byIdPath;
+                break;
+            }
+
+            if (File.Exists(selection))
+            {
+                selectedPath = selection;
+                break;
+            }
+        }
+
+        Console.WriteLine("[SENSOR] Perfil inválido. Tenta novamente.");
     }
 
     Dictionary<string, string> values = File.ReadAllLines(selectedPath)
