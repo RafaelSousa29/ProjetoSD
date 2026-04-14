@@ -10,10 +10,10 @@ const string CONFIG_DIR = "../dados/config";
 const string INTERVALO_GERACAO_MS = "1000";
 const int TEMPO_VARIACAO_MIN = 30000;
 
-var dadosReaisPorZona = new Dictionary<string, Dictionary<string, (double min, double max, double variacao)>>
+var dadosReaisPorZona = new Dictionary<string, Dictionary<string, (double min, double max, double variacao)>>(StringComparer.OrdinalIgnoreCase)
 {
     {
-        "ZONA_PARQUE", new Dictionary<string, (double, double, double)>
+        "ZONA_PARQUE", new Dictionary<string, (double, double, double)>(StringComparer.OrdinalIgnoreCase)
         {
             { "TEMP", (10.0, 32.0, 0.5) },
             { "HUM", (30.0, 85.0, 2.0) },
@@ -22,7 +22,7 @@ var dadosReaisPorZona = new Dictionary<string, Dictionary<string, (double min, d
         }
     },
     {
-        "ZONA_ESCOLAR", new Dictionary<string, (double, double, double)>
+        "ZONA_ESCOLAR", new Dictionary<string, (double, double, double)>(StringComparer.OrdinalIgnoreCase)
         {
             { "TEMP", (18.0, 28.0, 0.3) },
             { "HUM", (40.0, 70.0, 1.0) },
@@ -31,7 +31,7 @@ var dadosReaisPorZona = new Dictionary<string, Dictionary<string, (double min, d
         }
     },
     {
-        "ZONA_CENTRO", new Dictionary<string, (double, double, double)>
+        "ZONA_CENTRO", new Dictionary<string, (double, double, double)>(StringComparer.OrdinalIgnoreCase)
         {
             { "TEMP", (15.0, 30.0, 0.8) },
             { "HUM", (35.0, 75.0, 1.5) },
@@ -40,7 +40,7 @@ var dadosReaisPorZona = new Dictionary<string, Dictionary<string, (double min, d
         }
     },
     {
-        "ZONA_PASSEIO", new Dictionary<string, (double, double, double)>
+        "ZONA_PASSEIO", new Dictionary<string, (double, double, double)>(StringComparer.OrdinalIgnoreCase)
         {
             { "TEMP", (12.0, 30.0, 0.6) },
             { "HUM", (30.0, 80.0, 2.0) },
@@ -51,7 +51,6 @@ var dadosReaisPorZona = new Dictionary<string, Dictionary<string, (double min, d
 };
 
 var valoresActuais = new Dictionary<string, Dictionary<string, double>>();
-var tiposActuaisPerSensor = new Dictionary<string, string>(); // Track current config
 
 object lockFicheiro = new object();
 object lockConfig = new object();
@@ -89,7 +88,6 @@ foreach (var sensor in sensores)
     Console.WriteLine($"  {sensor.SensorId} ({sensor.Zona}) - Tipos disponíveis: {string.Join(", ", sensor.Tipos)}");
     
     valoresActuais[sensor.SensorId] = new Dictionary<string, double>();
-    tiposActuaisPerSensor[sensor.SensorId] = "";
     
     foreach (var tipo in sensor.Tipos)
     {
@@ -101,7 +99,7 @@ foreach (var sensor in sensores)
     }
 }
 
-Console.WriteLine();
+Console.WriteLine("\n[GERADOR] ✓ Iniciando geração de dados...\n");
 
 List<Thread> threadsGeradores = new();
 
@@ -130,71 +128,72 @@ void GerarDadosPorSensor(SensorInfo sensor)
     string configFile = Path.Combine(CONFIG_DIR, $"config_{sensor.SensorId}.txt");
     Random random = new Random();
     DateTime ultimaVariacao = DateTime.Now;
-    int tentativasConfig = 0;
     string ultimaConfig = "";
+    bool jaAviso = false;
 
     while (geradorAtivo)
     {
         try
         {
-            // Obter tipos activos
+            // Obter tipos activos (do ficheiro de config ou dos tipos padrão do CSV)
             string configActual = ObterConfigActiva(configFile);
-
-            // Se a config mudou, limpar o ficheiro de medições
-            if (!string.IsNullOrEmpty(configActual) && configActual != ultimaConfig)
+            
+            List<string> tiposAtivos;
+            
+            if (!string.IsNullOrEmpty(configActual))
             {
-                ultimaConfig = configActual;
-                tentativasConfig = 0;
+                // Config existe, usar apenas esses tipos (case-insensitive)
+                tiposAtivos = configActual.Split(',')
+                    .Select(t => t.Trim().ToUpper())
+                    .Where(t => !string.IsNullOrEmpty(t))
+                    .ToList();
                 
-                lock (lockFicheiro)
+                if (configActual != ultimaConfig)
                 {
-                    try
+                    ultimaConfig = configActual;
+                    jaAviso = false;
+                    
+                    // Limpar ficheiro se config mudou
+                    lock (lockFicheiro)
                     {
-                        if (File.Exists(ficheiro))
+                        try
                         {
-                            File.Delete(ficheiro);
-                            Console.WriteLine($"[GERADOR] 🔄 {sensor.SensorId}: Configuração mudou - ficheiro reiniciado");
+                            if (File.Exists(ficheiro))
+                            {
+                                File.Delete(ficheiro);
+                                Console.WriteLine($"[GERADOR] 🔄 {sensor.SensorId}: Configuração mudou - ficheiro reiniciado");
+                                Console.WriteLine($"[GERADOR] 🔄 {sensor.SensorId}: Gerando dados para - {string.Join(", ", tiposAtivos)}");
+                            }
                         }
+                        catch { }
                     }
-                    catch { }
+                }
+            }
+            else
+            {
+                // Sem config, usar tipos padrão do CSV
+                tiposAtivos = sensor.Tipos;
+                
+                if (!jaAviso)
+                {
+                    Console.WriteLine($"[GERADOR] ✓ {sensor.SensorId}: Gerando dados padrão - {string.Join(", ", tiposAtivos)}");
+                    jaAviso = true;
                 }
             }
 
-            List<string> tiposActivos = string.IsNullOrEmpty(configActual) 
-                ? new List<string>() 
-                : configActual.Split(',').Select(t => t.Trim()).ToList();
-
-            if (tiposActivos.Count == 0)
+            if (tiposAtivos.Count == 0)
             {
-                tentativasConfig++;
-                if (tentativasConfig == 1)
-                {
-                    Console.WriteLine($"[GERADOR] ⏳ {sensor.SensorId}: Aguardando configuração do sensor...");
-                }
-                if (tentativasConfig > 60) // 60 segundos de espera
-                {
-                    Console.WriteLine($"[GERADOR] ⚠️  {sensor.SensorId}: Timeout - usando tipos padrão");
-                    tiposActivos = sensor.Tipos;
-                    ultimaConfig = string.Join(",", sensor.Tipos);
-                }
-                else
-                {
-                    Thread.Sleep(1000);
-                    continue;
-                }
-            }
-            else if (tentativasConfig > 0)
-            {
-                Console.WriteLine($"[GERADOR] ✓ {sensor.SensorId}: Gerando dados para - {string.Join(", ", tiposActivos)}");
-                tentativasConfig = 0;
+                Thread.Sleep(1000);
+                continue;
             }
 
             // Selecionar tipo aleatório
-            string tipoSelecionado = tiposActivos[random.Next(tiposActivos.Count)];
+            string tipoSelecionado = tiposAtivos[random.Next(tiposAtivos.Count)];
 
-            if (dadosReaisPorZona[sensor.Zona].ContainsKey(tipoSelecionado))
+            // Procurar o tipo (case-insensitive)
+            if (dadosReaisPorZona[sensor.Zona].TryGetValue(tipoSelecionado, out var parametros))
             {
-                var (min, max, variacao) = dadosReaisPorZona[sensor.Zona][tipoSelecionado];
+                var (min, max, variacao) = parametros;
 
                 // Inicializar valor se não existe
                 if (!valoresActuais[sensor.SensorId].ContainsKey(tipoSelecionado))
@@ -233,6 +232,10 @@ void GerarDadosPorSensor(SensorInfo sensor)
                         Console.WriteLine($"[GERADOR] ⚠️  {sensor.SensorId}: Erro ao escrever - {ex.Message}");
                     }
                 }
+            }
+            else
+            {
+                Console.WriteLine($"[GERADOR] ⚠️  {sensor.SensorId}: Tipo '{tipoSelecionado}' não encontrado em ZONA_PARQUE");
             }
 
             Thread.Sleep(int.Parse(INTERVALO_GERACAO_MS));
@@ -296,7 +299,7 @@ List<SensorInfo> CarregarSensoresDoCSV()
                 string sensorId = partes[0].Trim();
                 string estado = partes[1].Trim();
                 string zona = partes[2].Trim();
-                var tipos = partes[3].Split(',').Select(t => t.Trim()).ToList();
+                var tipos = partes[3].Split(',').Select(t => t.Trim().ToUpper()).ToList();
 
                 if (estado.ToLower() == "ativo" && dadosReaisPorZona.ContainsKey(zona))
                 {

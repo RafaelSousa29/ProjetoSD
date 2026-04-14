@@ -1,0 +1,22 @@
+{
+  "zonas_validas": [
+    "ZONA_PARQUE",
+    "ZONA_ESCOLAR",
+    "ZONA_CENTRO",
+    "ZONA_PASSEIO"
+  ],
+  "tipos_dados_suportados": [
+    "TEMP",
+    "HUM",
+    "RUIDO",
+    "PM2.5",
+    "CO2",
+    "LUZ"
+  ],
+  "sensores_registados": [],
+  "parametros_gateway": {
+    "max_batch_size": 5,
+    "batch_timeout_ms": 300000,
+    "heartbeat_timeout_seconds": 60
+  }
+}

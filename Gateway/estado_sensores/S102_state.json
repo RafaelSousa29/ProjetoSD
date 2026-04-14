@@ -1,0 +1,12 @@
+{
+  "SensorId": "S102",
+  "Zona": "ZONA_ESCOLAR",
+  "TiposDados": [
+    "TEMP",
+    "PM2.5",
+    "RUIDO"
+  ],
+  "Estado": "offline",
+  "UltimoHeartbeat": "2026-04-13T21:47:03.4101805+01:00",
+  "UltimoSync": "0001-01-01T00:00:00"
+}

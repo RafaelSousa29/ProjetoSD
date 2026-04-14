@@ -1,33 +1,43 @@
 ﻿using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 
+const string CONFIG_DIR_SENSORS = "../sensor_configs";
 const string GATEWAY_IP = "127.0.0.1";
 const int GATEWAY_PORT = 5000;
 const string DADOS_DIR = "../dados";
 const string CONFIG_DIR = "../dados/config";
-const int INTERVALO_LEITURA_MS = 5000; // 5 segundos para ler ficheiro
-const int HEARTBEAT_NORMAL_MS = 10000; // 10 segundos
-const int HEARTBEAT_MANUTENCAO_MS = 180000; // 3 minutos
+const int INTERVALO_LEITURA_MS = 5000;
+const int HEARTBEAT_NORMAL_MS = 10000;
+const int HEARTBEAT_MANUTENCAO_MS = 180000;
 const int NIVEL_BATERIA_INICIAL = 100;
 const int LIMITE_BATERIA_CRITICA = 20;
-const int CONSUMO_LOTE = 5; // Consumo por envio de LOTE
+const int CONSUMO_LOTE = 5;
 const int CONSUMO_HEARTBEAT = 1;
-const int MAX_LOTE_SIZE = 5; // Máximo de medições por lote
-const int TIMEOUT_LOTE_MS = 30000; // 30 segundos ou enviar o lote mesmo que incompleto
+const int MAX_LOTE_SIZE = 5;
+const int TIMEOUT_LOTE_MS = 30000;
 
-Console.Write("ID do sensor: ");
-string sensorId = Console.ReadLine()?.Trim() ?? "S101";
+// ✨ NOVO: Menu para escolher sensor
+string configName = args.Length > 0 ? args[0] : MostrarMenuSensores();
 
-Console.Write("Zona: ");
-string zona = Console.ReadLine()?.Trim() ?? "ZONA_PARQUE";
+if (string.IsNullOrEmpty(configName))
+{
+    Console.WriteLine("[SENSOR] Nenhum sensor selecionado. Encerrando.");
+    return;
+}
 
-Console.Write("Tipos de dados que este sensor vai usar (ex: TEMP,RUIDO): ");
-string tiposDados = Console.ReadLine()?.Trim() ?? "TEMP";
+// Carregar configuração do sensor específico
+var sensorConfig = CarregarOuCriarConfiguracao(configName);
+
+string sensorId = sensorConfig.SensorId;
+string zona = sensorConfig.Zona;
+string tiposDados = sensorConfig.TiposDados;
 
 string MEDICOES_FILE = Path.Combine(DADOS_DIR, $"medicoes_{sensorId}.txt");
 string CONFIG_FILE = Path.Combine(CONFIG_DIR, $"config_{sensorId}.txt");
+string SENSOR_CONFIG_FILE = Path.Combine(CONFIG_DIR_SENSORS, $"{configName}_config.json");
 
 TcpClient? client = null;
 StreamReader? reader = null;
@@ -42,7 +52,6 @@ int heartbeatCount = 0;
 int nivelBateria = NIVEL_BATERIA_INICIAL;
 long ultimaLeitura = 0;
 
-// Buffer para lote de medições
 List<string> bufferMedicoes = new();
 DateTime ultimoEnvioLote = DateTime.Now;
 
@@ -60,14 +69,14 @@ try
     try
     {
         File.WriteAllText(CONFIG_FILE, tiposDados);
-        Console.WriteLine($"[SENSOR] ✓ Configuração guardada: {tiposDados}");
+        Console.WriteLine($"[SENSOR {sensorId}] ✓ Configuração guardada: {tiposDados}");
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[SENSOR] ⚠ Erro ao guardar config: {ex.Message}");
+        Console.WriteLine($"[SENSOR {sensorId}] ⚠ Erro ao guardar config: {ex.Message}");
     }
 
-    Console.WriteLine("[SENSOR] A conectar ao gateway...");
+    Console.WriteLine($"[SENSOR {sensorId}] A conectar ao gateway...");
     
     client = new TcpClient();
     client.Connect(GATEWAY_IP, GATEWAY_PORT);
@@ -81,18 +90,18 @@ try
     writer.Flush();
 
     string? response = reader.ReadLine();
-    Console.WriteLine($"[SENSOR] Resposta: {response}");
+    Console.WriteLine($"[SENSOR {sensorId}] Resposta: {response}");
 
     if (response == "CONN_ACK|ACEITE")
     {
         ligado = true;
         modoManutencao = false;
-        Console.WriteLine("[SENSOR] ✓ Ligação aceite em modo normal.");
-        Console.WriteLine($"[SENSOR] Ficheiro: {MEDICOES_FILE}");
-        Console.WriteLine($"[SENSOR] Tipos activos: {tiposDados}");
-        Console.WriteLine($"[SENSOR] Sistema de lotes: MAX={MAX_LOTE_SIZE} | TIMEOUT={TIMEOUT_LOTE_MS}ms");
-        Console.WriteLine($"[SENSOR] Consumo: Lote={CONSUMO_LOTE}% | Heartbeat={CONSUMO_HEARTBEAT}%");
-        Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}%\n");
+        Console.WriteLine($"[SENSOR {sensorId}] ✓ Ligação aceite em modo normal.");
+        Console.WriteLine($"[SENSOR {sensorId}] ID: {sensorId} | Zona: {zona}");
+        Console.WriteLine($"[SENSOR {sensorId}] Ficheiro: {MEDICOES_FILE}");
+        Console.WriteLine($"[SENSOR {sensorId}] Tipos activos: {tiposDados}");
+        Console.WriteLine($"[SENSOR {sensorId}] Sistema de lotes: MAX={MAX_LOTE_SIZE} | TIMEOUT={TIMEOUT_LOTE_MS}ms");
+        Console.WriteLine($"[SENSOR {sensorId}] Bateria: {nivelBateria}%\n");
 
         heartbeatAtivo = true;
         Thread heartbeatThread = new Thread(HeartbeatLoop)
@@ -102,26 +111,24 @@ try
         };
         heartbeatThread.Start();
 
-        // Thread para verificar timeout do lote
-        Thread timeoutLotetThread = new Thread(VerificarTimeoutLote)
+        Thread timeoutLoteThread = new Thread(VerificarTimeoutLote)
         {
             Name = $"TimeoutLote-{sensorId}",
             IsBackground = true
         };
-        timeoutLotetThread.Start();
+        timeoutLoteThread.Start();
     }
     else if (response == "CONN_ACK|MANUTENCAO")
     {
         ligado = true;
         modoManutencao = true;
-        Console.WriteLine("[SENSOR] ✓ Ligação aceite em modo manutenção.");
-        Console.WriteLine($"[SENSOR] Ficheiro: {MEDICOES_FILE}");
-        Console.WriteLine($"[SENSOR] Tipos activos: {tiposDados}");
-        Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}%\n");
+        Console.WriteLine($"[SENSOR {sensorId}] ✓ Ligação aceite em modo manutenção.");
+        Console.WriteLine($"[SENSOR {sensorId}] ID: {sensorId} | Zona: {zona}");
+        Console.WriteLine($"[SENSOR {sensorId}] Bateria: {nivelBateria}%\n");
     }
     else
     {
-        Console.WriteLine("[SENSOR] ✗ Ligação recusada. Encerrando.");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Ligação recusada. Encerrando.");
         reader?.Dispose();
         writer?.Dispose();
         client?.Dispose();
@@ -130,15 +137,14 @@ try
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"[SENSOR] ✗ Erro ao ligar ao gateway: {ex.Message}");
+    Console.WriteLine($"[SENSOR {sensorId}] ✗ Erro ao ligar ao gateway: {ex.Message}");
     return;
 }
 
-// Loop principal - Menu interativo
 while (sensorEmExecucao && ligado)
 {
     Console.WriteLine();
-    Console.WriteLine("===== SENSOR =====");
+    Console.WriteLine($"===== SENSOR {sensorId} =====");
     Console.WriteLine($"Bateria: {nivelBateria}%");
     Console.WriteLine($"Modo: {(modoManutencao ? "MANUTENÇÃO" : "NORMAL")}");
     Console.WriteLine($"Leitura Automática: {(leituraAutomaticaAtiva ? "✓ ATIVA" : "✗ Inativa")}");
@@ -182,7 +188,7 @@ while (sensorEmExecucao && ligado)
                     if (leituraAutomaticaAtiva)
                     {
                         leituraAutomaticaAtiva = false;
-                        Console.WriteLine("[SENSOR] ⏹ Parando leitura automática...");
+                        Console.WriteLine($"[SENSOR {sensorId}] ⏹ Parando leitura automática...");
                         Thread.Sleep(1000);
                     }
                     else
@@ -194,7 +200,7 @@ while (sensorEmExecucao && ligado)
                             IsBackground = true
                         };
                         leituraThread.Start();
-                        Console.WriteLine("[SENSOR] ▶ Leitura automática iniciada...");
+                        Console.WriteLine($"[SENSOR {sensorId}] ▶ Leitura automática iniciada...");
                     }
                 }
                 else
@@ -206,7 +212,7 @@ while (sensorEmExecucao && ligado)
             case "3":
                 if (!modoManutencao)
                 {
-                    Console.WriteLine("[SENSOR] 📤 Forçando envio do lote...");
+                    Console.WriteLine($"[SENSOR {sensorId}] 📤 Forçando envio do lote...");
                     EnviarLote();
                 }
                 else
@@ -222,7 +228,7 @@ while (sensorEmExecucao && ligado)
                 }
                 else
                 {
-                    Console.WriteLine("[SENSOR] A desligar...");
+                    Console.WriteLine($"[SENSOR {sensorId}] A desligar...");
                     sensorEmExecucao = false;
                     leituraAutomaticaAtiva = false;
                 }
@@ -231,7 +237,7 @@ while (sensorEmExecucao && ligado)
             case "5":
                 if (!modoManutencao)
                 {
-                    Console.WriteLine("[SENSOR] A desligar...");
+                    Console.WriteLine($"[SENSOR {sensorId}] A desligar...");
                     sensorEmExecucao = false;
                     leituraAutomaticaAtiva = false;
                 }
@@ -244,25 +250,232 @@ while (sensorEmExecucao && ligado)
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[SENSOR] ✗ Erro: {ex.Message}");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Erro: {ex.Message}");
     }
 
     if (nivelBateria <= 0)
     {
-        Console.WriteLine("\n[SENSOR] ✗ Bateria completamente descarregada. Desligando...");
+        Console.WriteLine($"\n[SENSOR {sensorId}] ✗ Bateria completamente descarregada. Desligando...");
         sensorEmExecucao = false;
     }
 }
 
 DesligarSensor();
-Console.WriteLine("\n[SENSOR] Programa encerrado.");
+Console.WriteLine($"\n[SENSOR {sensorId}] Programa encerrado.");
 return;
+
+// ✨ NOVO: Menu para escolher sensor
+string MostrarMenuSensores()
+{
+    if (!Directory.Exists(CONFIG_DIR_SENSORS))
+    {
+        Directory.CreateDirectory(CONFIG_DIR_SENSORS);
+    }
+
+    // Listar sensores existentes
+    var ficheirosConfig = Directory.GetFiles(CONFIG_DIR_SENSORS, "*_config.json");
+    var sensoresExistentes = new List<string>();
+
+    Console.WriteLine("\n===== GERENCIADOR DE SENSORES =====\n");
+
+    if (ficheirosConfig.Length > 0)
+    {
+        Console.WriteLine("Sensores existentes:\n");
+        
+        for (int i = 0; i < ficheirosConfig.Length; i++)
+        {
+            string nome = Path.GetFileNameWithoutExtension(ficheirosConfig[i]).Replace("_config", "");
+            sensoresExistentes.Add(nome);
+            
+            try
+            {
+                string json = File.ReadAllText(ficheirosConfig[i]);
+                var config = JsonSerializer.Deserialize<SensorConfiguracao>(json);
+                Console.WriteLine($"{i + 1}. {nome} - Zona: {config?.Zona} | Tipos: {config?.TiposDados}");
+            }
+            catch
+            {
+                Console.WriteLine($"{i + 1}. {nome}");
+            }
+        }
+
+        Console.WriteLine($"\n{ficheirosConfig.Length + 1}. [+] Criar novo sensor");
+        Console.WriteLine($"{ficheirosConfig.Length + 2}. [E] Editar sensor existente");
+        Console.WriteLine($"{ficheirosConfig.Length + 3}. [X] Sair");
+    }
+    else
+    {
+        Console.WriteLine("Nenhum sensor existente.\n");
+        Console.WriteLine("1. [+] Criar novo sensor");
+        Console.WriteLine("2. [X] Sair");
+    }
+
+    Console.Write("\nEscolha: ");
+    string? escolha = Console.ReadLine()?.Trim();
+
+    if (string.IsNullOrEmpty(escolha))
+        return "";
+
+    // Opção: Sair
+    if (escolha.ToUpper() == "X")
+    {
+        return "";
+    }
+
+    // Opção: Editar sensor
+    if (escolha.ToUpper() == "E")
+    {
+        if (sensoresExistentes.Count == 0)
+        {
+            Console.WriteLine("Nenhum sensor para editar.");
+            return "";
+        }
+
+        Console.Write("\nQual sensor deseja editar (ex: S101)? ");
+        string? sensorEditar = Console.ReadLine()?.Trim();
+        
+        if (string.IsNullOrEmpty(sensorEditar))
+            return "";
+
+        return sensorEditar;
+    }
+
+    // Opção: Selecionar existente ou criar novo
+    if (int.TryParse(escolha, out int opcao))
+    {
+        if (opcao > 0 && opcao <= sensoresExistentes.Count)
+        {
+            return sensoresExistentes[opcao - 1];
+        }
+        else if (opcao == sensoresExistentes.Count + 1)
+        {
+            return CriarNovoSensor();
+        }
+    }
+
+    return "";
+}
+
+// ✨ NOVO: Criar novo sensor
+string CriarNovoSensor()
+{
+    Console.WriteLine("\n===== CRIAR NOVO SENSOR =====\n");
+
+    Console.Write("ID do sensor (ex: S101): ");
+    string? sensorId = Console.ReadLine()?.Trim();
+    
+    if (string.IsNullOrEmpty(sensorId))
+        return "";
+
+    Console.Write("Zona (ex: ZONA_PARQUE): ");
+    string? zona = Console.ReadLine()?.Trim() ?? "ZONA_PARQUE";
+
+    Console.Write("Tipos de dados (ex: TEMP,RUIDO): ");
+    string? tiposDados = Console.ReadLine()?.Trim() ?? "TEMP";
+
+    var config = new SensorConfiguracao
+    {
+        SensorId = sensorId,
+        Zona = zona,
+        TiposDados = tiposDados
+    };
+
+    // Guardar configuração
+    if (!Directory.Exists(CONFIG_DIR_SENSORS))
+    {
+        Directory.CreateDirectory(CONFIG_DIR_SENSORS);
+    }
+
+    string configPath = Path.Combine(CONFIG_DIR_SENSORS, $"{sensorId}_config.json");
+    
+    try
+    {
+        string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(configPath, json);
+        Console.WriteLine($"\n✓ Sensor '{sensorId}' criado com sucesso!");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n✗ Erro ao criar sensor: {ex.Message}");
+        return "";
+    }
+
+    return sensorId;
+}
+
+SensorConfiguracao CarregarOuCriarConfiguracao(string configName)
+{
+    if (!Directory.Exists(CONFIG_DIR_SENSORS))
+    {
+        Directory.CreateDirectory(CONFIG_DIR_SENSORS);
+    }
+
+    string configPath = Path.Combine(CONFIG_DIR_SENSORS, $"{configName}_config.json");
+
+    // Tentar carregar do ficheiro
+    if (File.Exists(configPath))
+    {
+        try
+        {
+            string json = File.ReadAllText(configPath);
+            var configCarregada = JsonSerializer.Deserialize<SensorConfiguracao>(json);
+            
+            if (configCarregada != null && !string.IsNullOrEmpty(configCarregada.SensorId))
+            {
+                Console.WriteLine($"[SENSOR] ✓ Configuração carregada de '{configPath}'");
+                Console.WriteLine($"  ID: {configCarregada.SensorId}");
+                Console.WriteLine($"  Zona: {configCarregada.Zona}");
+                Console.WriteLine($"  Tipos: {configCarregada.TiposDados}\n");
+                return configCarregada;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SENSOR] ⚠ Erro ao ler ficheiro: {ex.Message}");
+        }
+    }
+
+    // Se não encontrou, pedir manualmente
+    Console.WriteLine($"[SENSOR] Nenhuma configuração encontrada para '{configName}'.\n");
+    Console.WriteLine("Insira os dados do sensor:\n");
+
+    Console.Write("ID do sensor (ex: S101): ");
+    string sensorId = Console.ReadLine()?.Trim() ?? "S101";
+
+    Console.Write("Zona (ex: ZONA_PARQUE): ");
+    string zona = Console.ReadLine()?.Trim() ?? "ZONA_PARQUE";
+
+    Console.Write("Tipos de dados (ex: TEMP,RUIDO): ");
+    string tiposDados = Console.ReadLine()?.Trim() ?? "TEMP";
+
+    var configNova = new SensorConfiguracao
+    {
+        SensorId = sensorId,
+        Zona = zona,
+        TiposDados = tiposDados
+    };
+
+    // Guardar automaticamente
+    try
+    {
+        string json = JsonSerializer.Serialize(configNova, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(configPath, json);
+        Console.WriteLine($"\n[SENSOR] ✓ Configuração guardada em '{configPath}'");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"\n[SENSOR] ⚠ Erro ao guardar ficheiro: {ex.Message}");
+    }
+
+    Console.WriteLine();
+    return configNova;
+}
 
 void EnviarMedicaoManual()
 {
     if (!ligado || writer == null || reader == null)
     {
-        Console.WriteLine("[SENSOR] ✗ Sensor não ligado ao gateway.");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Sensor não ligado ao gateway.");
         return;
     }
 
@@ -278,11 +491,11 @@ void EnviarMedicaoManual()
     lock (lockBuffer)
     {
         bufferMedicoes.Add(medicao);
-        Console.WriteLine($"[SENSOR] ✓ Medição adicionada ao buffer ({bufferMedicoes.Count}/{MAX_LOTE_SIZE})");
+        Console.WriteLine($"[SENSOR {sensorId}] ✓ Medição adicionada ao buffer ({bufferMedicoes.Count}/{MAX_LOTE_SIZE})");
 
         if (bufferMedicoes.Count >= MAX_LOTE_SIZE)
         {
-            Console.WriteLine("[SENSOR] 📤 Lote cheio! Enviando...");
+            Console.WriteLine($"[SENSOR {sensorId}] 📤 Lote cheio! Enviando...");
             EnviarLote();
         }
     }
@@ -292,13 +505,13 @@ void EnviarHeartbeatManual()
 {
     if (!ligado || writer == null || reader == null)
     {
-        Console.WriteLine("[SENSOR] ✗ Sensor não ligado ao gateway.");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Sensor não ligado ao gateway.");
         return;
     }
 
     if (nivelBateria - CONSUMO_HEARTBEAT <= 0)
     {
-        Console.WriteLine("[SENSOR] ✗ Bateria insuficiente para heartbeat.");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Bateria insuficiente para heartbeat.");
         return;
     }
 
@@ -313,10 +526,10 @@ void EnviarHeartbeatManual()
             writer.Flush();
 
             string? response = reader.ReadLine();
-            Console.WriteLine($"[SENSOR] Resposta: {response}");
+            Console.WriteLine($"[SENSOR {sensorId}] Resposta: {response}");
 
             nivelBateria -= CONSUMO_HEARTBEAT;
-            Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}%");
+            Console.WriteLine($"[SENSOR {sensorId}] Bateria: {nivelBateria}%");
 
             if (nivelBateria <= LIMITE_BATERIA_CRITICA && !modoManutencao)
             {
@@ -325,7 +538,7 @@ void EnviarHeartbeatManual()
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SENSOR] ✗ Erro ao enviar heartbeat: {ex.Message}");
+            Console.WriteLine($"[SENSOR {sensorId}] ✗ Erro ao enviar heartbeat: {ex.Message}");
         }
     }
 }
@@ -347,17 +560,17 @@ void EnviarNotificacaoBateria()
             writer.Flush();
 
             string? response = reader.ReadLine();
-            Console.WriteLine($"\n[SENSOR] ⚠ Notificação de bateria fraca enviada. Resposta: {response}");
+            Console.WriteLine($"\n[SENSOR {sensorId}] ⚠ Notificação de bateria fraca enviada. Resposta: {response}");
 
             modoManutencao = true;
             heartbeatAtivo = false;
             leituraAutomaticaAtiva = false;
-            Console.WriteLine("[SENSOR] ⚠ Entrando em modo de manutenção...");
+            Console.WriteLine($"[SENSOR {sensorId}] ⚠ Entrando em modo de manutenção...");
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[SENSOR] ✗ Erro ao enviar notificação: {ex.Message}");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Erro ao enviar notificação: {ex.Message}");
     }
 }
 
@@ -369,7 +582,7 @@ void LerMedicoesAutomatico()
         {
             if (nivelBateria <= 0)
             {
-                Console.WriteLine("\n[SENSOR] ✗ Bateria descarregada. Parando leitura automática...");
+                Console.WriteLine($"\n[SENSOR {sensorId}] ✗ Bateria descarregada. Parando leitura automática...");
                 leituraAutomaticaAtiva = false;
                 break;
             }
@@ -404,11 +617,11 @@ void LerMedicoesAutomatico()
                                     lock (lockBuffer)
                                     {
                                         bufferMedicoes.Add($"{tipo}|{valor}|{timestamp}");
-                                        Console.WriteLine($"[SENSOR-AUTO] {tipo}={valor} | Buffer: {bufferMedicoes.Count}/{MAX_LOTE_SIZE}");
+                                        Console.WriteLine($"[SENSOR {sensorId}-AUTO] {tipo}={valor} | Buffer: {bufferMedicoes.Count}/{MAX_LOTE_SIZE}");
 
                                         if (bufferMedicoes.Count >= MAX_LOTE_SIZE)
                                         {
-                                            Console.WriteLine("[SENSOR-AUTO] 📤 Lote cheio! Enviando...");
+                                            Console.WriteLine($"[SENSOR {sensorId}-AUTO] 📤 Lote cheio! Enviando...");
                                             EnviarLote();
                                         }
                                     }
@@ -426,7 +639,7 @@ void LerMedicoesAutomatico()
             }
             else
             {
-                Console.WriteLine($"\n[SENSOR] ⚠ Ficheiro não encontrado: {MEDICOES_FILE}");
+                Console.WriteLine($"\n[SENSOR {sensorId}] ⚠ Ficheiro não encontrado: {MEDICOES_FILE}");
                 leituraAutomaticaAtiva = false;
             }
 
@@ -434,7 +647,7 @@ void LerMedicoesAutomatico()
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\n[SENSOR] ✗ Erro no loop automático: {ex.Message}");
+            Console.WriteLine($"\n[SENSOR {sensorId}] ✗ Erro no loop automático: {ex.Message}");
             Thread.Sleep(2000);
         }
     }
@@ -448,19 +661,19 @@ void EnviarLote()
     {
         if (bufferMedicoes.Count == 0)
         {
-            Console.WriteLine("[SENSOR] ⚠ Buffer vazio, nada a enviar.");
+            Console.WriteLine($"[SENSOR {sensorId}] ⚠ Buffer vazio, nada a enviar.");
             return;
         }
 
         if (!ligado || writer == null || reader == null)
         {
-            Console.WriteLine("[SENSOR] ✗ Sensor não ligado ao gateway.");
+            Console.WriteLine($"[SENSOR {sensorId}] ✗ Sensor não ligado ao gateway.");
             return;
         }
 
         if (nivelBateria - CONSUMO_LOTE <= 0)
         {
-            Console.WriteLine("[SENSOR] ✗ Bateria insuficiente para enviar lote.");
+            Console.WriteLine($"[SENSOR {sensorId}] ✗ Bateria insuficiente para enviar lote.");
             return;
         }
 
@@ -468,7 +681,6 @@ void EnviarLote()
         {
             try
             {
-                // Formatar lote: LOTE|sensor_id|qtd|med1#med2#med3
                 string lote = string.Join("#", bufferMedicoes);
                 string loteMsg = $"LOTE|{sensorId}|{bufferMedicoes.Count}|{lote}";
                 
@@ -476,10 +688,10 @@ void EnviarLote()
                 writer.Flush();
 
                 string? response = reader.ReadLine();
-                Console.WriteLine($"[SENSOR] 📥 Resposta: {response}");
+                Console.WriteLine($"[SENSOR {sensorId}] 📥 Resposta: {response}");
 
                 nivelBateria -= CONSUMO_LOTE;
-                Console.WriteLine($"[SENSOR] Bateria: {nivelBateria}% (após envio de lote)");
+                Console.WriteLine($"[SENSOR {sensorId}] Bateria: {nivelBateria}% (após envio de lote)");
 
                 bufferMedicoes.Clear();
                 ultimoEnvioLote = DateTime.Now;
@@ -491,7 +703,7 @@ void EnviarLote()
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[SENSOR] ✗ Erro ao enviar lote: {ex.Message}");
+                Console.WriteLine($"[SENSOR {sensorId}] ✗ Erro ao enviar lote: {ex.Message}");
             }
         }
     }
@@ -509,14 +721,14 @@ void VerificarTimeoutLote()
             {
                 if (bufferMedicoes.Count > 0 && (DateTime.Now - ultimoEnvioLote).TotalMilliseconds > TIMEOUT_LOTE_MS)
                 {
-                    Console.WriteLine($"\n[SENSOR-TIMEOUT] ⏱ Timeout atingido! Enviando {bufferMedicoes.Count} medições...");
+                    Console.WriteLine($"\n[SENSOR {sensorId}-TIMEOUT] ⏱ Timeout atingido! Enviando {bufferMedicoes.Count} medições...");
                     EnviarLote();
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SENSOR-TIMEOUT] ✗ Erro: {ex.Message}");
+            Console.WriteLine($"[SENSOR {sensorId}-TIMEOUT] ✗ Erro: {ex.Message}");
         }
     }
 }
@@ -535,7 +747,7 @@ void HeartbeatLoop()
 
             if (nivelBateria - CONSUMO_HEARTBEAT <= 0)
             {
-                Console.WriteLine("\n[SENSOR] ✗ Bateria insuficiente para heartbeat. Desligando...");
+                Console.WriteLine($"\n[SENSOR {sensorId}] ✗ Bateria insuficiente para heartbeat. Desligando...");
                 heartbeatAtivo = false;
                 sensorEmExecucao = false;
                 break;
@@ -557,11 +769,11 @@ void HeartbeatLoop()
 
                     if (response == null || !response.StartsWith("ACK_HEARTBEAT|SUCESSO"))
                     {
-                        Console.WriteLine($"\n[SENSOR-HB] ✗ Erro: {response} | Bateria: {nivelBateria}%");
+                        Console.WriteLine($"\n[SENSOR {sensorId}-HB] ✗ Erro: {response} | Bateria: {nivelBateria}%");
                     }
                     else if (heartbeatCount % 10 == 0)
                     {
-                        Console.WriteLine($"\n[SENSOR-HB] ✓ {heartbeatCount} enviados. Bateria: {nivelBateria}%");
+                        Console.WriteLine($"\n[SENSOR {sensorId}-HB] ✓ {heartbeatCount} enviados. Bateria: {nivelBateria}%");
                     }
 
                     if (nivelBateria <= LIMITE_BATERIA_CRITICA && !modoManutencao)
@@ -571,7 +783,7 @@ void HeartbeatLoop()
                 }
                 catch (IOException)
                 {
-                    Console.WriteLine("\n[SENSOR] ✗ Conexão perdida com gateway.");
+                    Console.WriteLine($"\n[SENSOR {sensorId}] ✗ Conexão perdida com gateway.");
                     heartbeatAtivo = false;
                     sensorEmExecucao = false;
                     break;
@@ -580,7 +792,7 @@ void HeartbeatLoop()
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SENSOR-HB] ✗ Erro: {ex.Message}");
+            Console.WriteLine($"[SENSOR {sensorId}-HB] ✗ Erro: {ex.Message}");
             break;
         }
     }
@@ -588,7 +800,7 @@ void HeartbeatLoop()
 
 void MostrarEstadoThreads()
 {
-    Console.WriteLine("\n===== ESTADO DAS THREADS =====");
+    Console.WriteLine($"\n===== ESTADO DAS THREADS - {sensorId} =====");
     Console.WriteLine($"Sensor Ligado: {(ligado ? "✓" : "✗")}");
     Console.WriteLine($"Sensor Ativo: {(sensorEmExecucao ? "✓" : "✗")}");
     Console.WriteLine($"Heartbeat Ativo: {(heartbeatAtivo ? "✓" : "✗")}");
@@ -618,12 +830,11 @@ void DesligarSensor()
         sensorEmExecucao = false;
         leituraAutomaticaAtiva = false;
 
-        // Enviar lote pendente antes de desligar
         lock (lockBuffer)
         {
             if (bufferMedicoes.Count > 0)
             {
-                Console.WriteLine($"\n[SENSOR] 📤 Enviando {bufferMedicoes.Count} medições pendentes...");
+                Console.WriteLine($"\n[SENSOR {sensorId}] 📤 Enviando {bufferMedicoes.Count} medições pendentes...");
                 EnviarLote();
             }
         }
@@ -637,12 +848,12 @@ void DesligarSensor()
                 try
                 {
                     string discMsg = $"DISCONNECT|{sensorId}";
-                    Console.WriteLine($"\n[SENSOR] A enviar: {discMsg}");
+                    Console.WriteLine($"\n[SENSOR {sensorId}] A enviar: {discMsg}");
                     writer.WriteLine(discMsg);
                     writer.Flush();
 
                     string? response = reader.ReadLine();
-                    Console.WriteLine($"[SENSOR] Resposta: {response}");
+                    Console.WriteLine($"[SENSOR {sensorId}] Resposta: {response}");
                 }
                 catch { }
             }
@@ -650,7 +861,7 @@ void DesligarSensor()
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[SENSOR] ✗ Erro ao desligar: {ex.Message}");
+        Console.WriteLine($"[SENSOR {sensorId}] ✗ Erro ao desligar: {ex.Message}");
     }
     finally
     {
@@ -663,4 +874,11 @@ void DesligarSensor()
         client = null;
         ligado = false;
     }
+}
+
+class SensorConfiguracao
+{
+    public string SensorId { get; set; } = "";
+    public string Zona { get; set; } = "";
+    public string TiposDados { get; set; } = "";
 }

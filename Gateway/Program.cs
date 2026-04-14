@@ -1,33 +1,73 @@
 ﻿using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 
-// --- CONFIGURAÇÕES DO GATEWAY ---
 const int GATEWAY_PORT = 5000;
 const string SERVER_IP = "127.0.0.1";
 const int SERVER_PORT = 6000;
 const string GATEWAY_ID = "GW01";
-const string CSV_FILE = "sensors.csv";
+const string GATEWAY_CONFIG_FILE = "gateway_config.json";
+const string ESTADO_DIR = "estado_sensores";
+const string PEDIDOS_PENDENTES_FILE = "pedidos_sensores_pendentes.json";
 const string HISTORY_FILE = "gateway_history.txt";
 
-// --- CONFIGURAÇÕES DE LOTE (Tarefa 2.2) ---
 const int MAX_BATCH_SIZE = 5;
 const int BATCH_TIMEOUT_MS = 300000;
-object lockBuffer = new object();
-object lockCsv = new object();
-List<string> _dataBuffer = new List<string>();
+const int HEARTBEAT_TIMEOUT_SECONDS = 60;
 
+object lockBuffer = new object();
+object lockEstado = new object();
+object lockHistorico = new object();
+object lockConfig = new object();
+object lockPedidos = new object();
+
+List<string> _dataBuffer = new List<string>();
+Dictionary<string, SensorEstado> estadoSensores = new Dictionary<string, SensorEstado>();
+List<PedidoSensor> pedidosPendentes = new List<PedidoSensor>();
 bool gatewayEmExecucao = true;
 
-// --- INICIALIZAÇÃO ---
-EnsureCsvExists();
-TcpListener listener = new TcpListener(IPAddress.Any, GATEWAY_PORT);
-listener.Start();
+// Carregar configuração
+var gatewayConfig = CarregarGatewayConfig();
 
+if (gatewayConfig == null)
+{
+    Console.WriteLine("[GATEWAY] ✗ Erro ao carregar configuração do gateway!");
+    return;
+}
+
+// Carregar pedidos pendentes
+CarregarPedidosPendentes();
+
+// Criar pasta de estado
+if (!Directory.Exists(ESTADO_DIR))
+{
+    Directory.CreateDirectory(ESTADO_DIR);
+    Console.WriteLine($"[GATEWAY] ✓ Pasta '{ESTADO_DIR}' criada.");
+}
+
+// Inicializar estado dos sensores registados
+foreach (var sensor in gatewayConfig.SensoresRegistados)
+{
+    estadoSensores[sensor.SensorId] = new SensorEstado
+    {
+        SensorId = sensor.SensorId,
+        Zona = sensor.Zona,
+        TiposDados = sensor.TiposDados.Split(',').Select(t => t.Trim()).ToList(),
+        Estado = "offline",
+        UltimoHeartbeat = DateTime.Now,
+        UltimoSync = DateTime.MinValue
+    };
+    CarregarEstadosPersistidos();
+    GuardarEstadoSensor(sensor.SensorId);
+}
+
+Console.WriteLine($"[GATEWAY {GATEWAY_ID}] ✓ {gatewayConfig.SensoresRegistados.Length} sensores registados");
 Console.WriteLine($"[GATEWAY {GATEWAY_ID}] Ativo na porta {GATEWAY_PORT}...");
-Console.WriteLine("Comandos: Escreva 'send' para forçar o envio do lote atual.");
+Console.WriteLine("Comandos: 'send' envio lote | 'status' estado sensores | 'pedidos' ver pedidos | 'aceitar S101' aprovar sensor | 'rejeitar S101' rejeitar");
 
-// Thread para envio automático por tempo (Tarefa 2.2)
+// Thread para envio automático
 Thread batchTimerThread = new Thread(BatchTimerLoop)
 {
     Name = "BatchTimer",
@@ -35,7 +75,15 @@ Thread batchTimerThread = new Thread(BatchTimerLoop)
 };
 batchTimerThread.Start();
 
-// Thread para comandos manuais na consola
+// Thread para monitorizar heartbeats
+Thread heartbeatMonitorThread = new Thread(MonitorizarHeartbeats)
+{
+    Name = "HeartbeatMonitor",
+    IsBackground = false
+};
+heartbeatMonitorThread.Start();
+
+// Thread para comandos manuais
 Thread commandThread = new Thread(ManualCommandLoop)
 {
     Name = "CommandListener",
@@ -43,15 +91,18 @@ Thread commandThread = new Thread(ManualCommandLoop)
 };
 commandThread.Start();
 
-// Loop principal - Aceitar conexões de sensores
-Console.WriteLine("[GATEWAY] À espera de sensores...");
+// TCP Listener
+TcpListener listener = new TcpListener(IPAddress.Any, GATEWAY_PORT);
+listener.Start();
+
+Console.WriteLine("[GATEWAY] À espera de sensores...\n");
+
 while (gatewayEmExecucao)
 {
     try
     {
         TcpClient sensorClient = listener.AcceptTcpClient();
         
-        // Criar thread para cada sensor conectado
         Thread sensorThread = new Thread(HandleSensor)
         {
             Name = $"Sensor-{DateTime.Now:HHmmss}",
@@ -61,7 +112,7 @@ while (gatewayEmExecucao)
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[GATEWAY] Erro ao aceitar conexão: {ex.Message}");
+        Console.WriteLine($"[GATEWAY] ✗ Erro ao aceitar conexão: {ex.Message}");
     }
 }
 
@@ -95,193 +146,294 @@ void HandleSensor(object? clientObj)
 
                 switch (command)
                 {
-                    case "CONNECT": // --- TAREFA 2.1: VALIDAÇÃO RIGOROSA ---
+                    case "CONNECT":
                         if (parts.Length < 4) break;
-                        string id = parts[1];
-                        string tiposSolicitadosRaw = parts[2];
+                        
+                        string sensorId = parts[1];
+                        string tiposSolicitadosRaw = parts[2];  
                         string zona = parts[3];
 
-                        var info = FindSensor(id);
-
-                        if (info != null && info.Estado != "desativado" && info.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
+                        // ✨ NOVO: Verificar se sensor está registado
+                        if (!estadoSensores.ContainsKey(sensorId))
                         {
-                            // 1. Criar lista do que o sensor enviou agora
-                            var tiposSolicitados = tiposSolicitadosRaw.Split(',')
-                                                                     .Select(t => t.Trim())
-                                                                     .ToList();
-
-                            // 2. VALIDAR: Todos os tipos que o sensor enviou existem na lista do CSV?
-                            // Ex: Se o sensor mandou "temperatura" mas o CSV diz "TEMP", isto vai dar FALSE.
-                            bool todosOsTiposSaoValidos = tiposSolicitados.All(ts =>
-                                info.TiposDados.Any(csvT => csvT.Equals(ts, StringComparison.OrdinalIgnoreCase)));
-
-                            if (todosOsTiposSaoValidos)
+                            Console.WriteLine($"[GATEWAY] ❓ Sensor {sensorId} não registado - Pedido em análise...");
+                            
+                            // Adicionar aos pedidos pendentes
+                            var pedido = new PedidoSensor
                             {
-                                currentSensorId = id;
-                                // Guardamos os tipos autorizados (usamos os do sensor porque já confirmámos que são válidos)
-                                currentTipos = new HashSet<string>(tiposSolicitados, StringComparer.OrdinalIgnoreCase);
-                                isConnected = true;
+                                SensorId = sensorId,
+                                Zona = zona,
+                                TiposDados = tiposSolicitadosRaw,
+                                DataPedido = DateTime.Now,
+                                Status = "pendente"
+                            };
 
-                                UpdateSensorEntry(id, info.Estado);
-
-                                string resp = (info.Estado == "manutencao") ? "CONN_ACK|MANUTENCAO" : "CONN_ACK|ACEITE";
-                                writer.WriteLine(resp);
-                                writer.Flush();
-                                Console.WriteLine($"[ACEITE] Sensor {id} conectado. Tipos: {string.Join(", ", currentTipos)}");
-                            }
-                            else
+                            lock (lockPedidos)
                             {
-                                // Se o tipo for "temperatura" em vez de "TEMP", ele cai aqui:
-                                writer.WriteLine("CONN_ACK|RECUSADO");
-                                writer.Flush();
-                                Console.WriteLine($"[RECUSADO] Sensor {id} tentou tipos não autorizados: {tiposSolicitadosRaw}");
+                                // Verificar se já existe pedido
+                                if (!pedidosPendentes.Any(p => p.SensorId == sensorId && p.Status == "pendente"))
+                                {
+                                    pedidosPendentes.Add(pedido);
+                                    GuardarPedidosPendentes();
+                                    Console.WriteLine($"[GATEWAY] 📝 Pedido do sensor {sensorId} registado");
+                                    Console.WriteLine($"[GATEWAY] ℹ️  Use 'aceitar {sensorId}' ou 'rejeitar {sensorId}' para processar");
+                                }
                             }
-                        }
-                        else
-                        {
-                            writer.WriteLine("CONN_ACK|RECUSADO");
+
+                            writer.WriteLine("CONN_ACK|PENDENTE|SENSOR_EM_APROVACAO");
                             writer.Flush();
-                            Console.WriteLine($"[RECUSADO] Sensor {id} falhou na validação de ID, Estado ou Zona.");
+                            return;
                         }
+
+                        var estadoSensor = estadoSensores[sensorId];
+
+                        // Validar zona
+                        if (!estadoSensor.Zona.Equals(zona, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.WriteLine($"[GATEWAY] ✗ Sensor {sensorId} zona inválida: {zona}");
+                            writer.WriteLine("CONN_ACK|RECUSADO|ZONA_INVALIDA");
+                            writer.Flush();
+                            return;
+                        }
+
+                        // Validar tipos de dados
+                        var tiposSolicitados = tiposSolicitadosRaw.Split(',')
+                            .Select(t => t.Trim().ToUpper())
+                            .ToList();
+
+                        bool todosOsTiposSaoValidos = tiposSolicitados.All(ts =>
+                            estadoSensor.TiposDados.Contains(ts));
+
+                        if (!todosOsTiposSaoValidos)
+                        {
+                            Console.WriteLine($"[GATEWAY] ✗ Sensor {sensorId} tipos não autorizados: {tiposSolicitadosRaw}");
+                            writer.WriteLine("CONN_ACK|RECUSADO|TIPOS_NAO_SUPORTADOS");
+                            writer.Flush();
+                            return;
+                        }
+
+                        // Sensor aceite!
+                        currentSensorId = sensorId;
+                        currentTipos = new HashSet<string>(tiposSolicitados, StringComparer.OrdinalIgnoreCase);
+                        isConnected = true;
+
+                        lock (lockEstado)
+                        {
+                            estadoSensor.Estado = "ativo";
+                            estadoSensor.UltimoHeartbeat = DateTime.Now;
+                            CarregarEstadosPersistidos();
+                            GuardarEstadoSensor(sensorId);
+                        }
+
+                        writer.WriteLine("CONN_ACK|ACEITE");
+                        writer.Flush();
+                        Console.WriteLine($"[GATEWAY] ✓ Sensor {sensorId} conectado - Tipos: {string.Join(", ", currentTipos)}");
                         break;
 
-                    case "DATA": // --- TAREFA 2.2 e 2.3: AGREGAÇÃO E REGISTO ---
-                        if (isConnected && currentSensorId != null && parts.Length >= 5)
+                    case "DATA":
+                        if (!isConnected || currentSensorId == null || parts.Length < 5)
                         {
-                            string tipoDado = parts[3];
+                            writer.WriteLine("DATA_ACK|ERRO|NAO_CONECTADO");
+                            writer.Flush();
+                            break;
+                        }
 
-                            if (currentTipos.Contains(tipoDado))
+                        string tipoDado = parts[3].ToUpper();
+
+                        if (!currentTipos.Contains(tipoDado))
+                        {
+                            writer.WriteLine("DATA_ACK|ERRO|TIPO_NAO_SUPORTADO");
+                            writer.Flush();
+                            break;
+                        }
+
+                        GuardarHistorico(line);
+
+                        lock (lockBuffer)
+                        {
+                            _dataBuffer.Add(line);
+                            Console.WriteLine($"[GATEWAY] 📊 {currentSensorId} - {tipoDado}: {parts[4]}");
+
+                            if (_dataBuffer.Count >= MAX_BATCH_SIZE)
                             {
-                                Console.WriteLine($"[RECEBIDO] Sensor {currentSensorId} enviou {tipoDado}: {parts[4]} (Guardado em buffer)");
-
-                                LogDataLocally(line);
-
-                                lock (lockBuffer)
+                                Thread envioThread = new Thread(EnviarLoteAoServidor)
                                 {
-                                    _dataBuffer.Add(line);
-                                    if (_dataBuffer.Count >= MAX_BATCH_SIZE)
-                                    {
-                                        // Forçar envio em thread dedicada
-                                        Thread envioThread = new Thread(ForwardBatchToServer)
-                                        {
-                                            Name = $"EnvioBatch-{DateTime.Now:HHmmss}",
-                                            IsBackground = true
-                                        };
-                                        envioThread.Start();
-                                    }
-                                }
-
-                                UpdateSensorEntry(currentSensorId, "ativo");
-                                writer.WriteLine("DATA_ACK|SUCESSO");
-                                writer.Flush();
-                            }
-                            else
-                            {
-                                writer.WriteLine("DATA_ACK|ERRO|TIPO_NAO_SUPORTADO");
-                                writer.Flush();
+                                    Name = $"EnvioBatch-{DateTime.Now:HHmmss}",
+                                    IsBackground = true
+                                };
+                                envioThread.Start();
                             }
                         }
+
+                        lock (lockEstado)
+                        {
+                            estadoSensores[currentSensorId].UltimoSync = DateTime.Now;
+                            estadoSensores[currentSensorId].UltimoHeartbeat = DateTime.Now;
+                            estadoSensores[currentSensorId].TotalMedicoes++; // ✨ NOVO
+                            GuardarEstadoSensor(currentSensorId);
+                        }
+
+                        writer.WriteLine("DATA_ACK|SUCESSO");
+                        writer.Flush();
                         break;
 
                     case "LOTE":
-                        if (isConnected && currentSensorId != null && parts.Length >= 4)
+                        if (!isConnected || currentSensorId == null || parts.Length < 4)
                         {
-                            try
+                            writer.WriteLine("LOTE_ACK|ERRO|NAO_CONECTADO");
+                            writer.Flush();
+                            break;
+                        }
+
+                        try
+                        {
+                            int qtd = int.Parse(parts[2]);
+                            string medicoesBrutas = string.Join("|", parts.Skip(3));
+                            var medicoes = medicoesBrutas.Split('#');
+
+                            int processadas = 0;
+
+                            foreach (var med in medicoes)
                             {
-                                int qtd = int.Parse(parts[2]);
-                                string medicoesBrutas = string.Join("|", parts.Skip(3)); // Recriar dados em caso de split extra
-                                var medicoes = medicoesBrutas.Split('#');
+                                if (string.IsNullOrWhiteSpace(med)) continue;
 
-                                Console.WriteLine($"[LOTE] Sensor {currentSensorId} enviou {qtd} medições");
-
-                                foreach (var med in medicoes)
+                                var medPartes = med.Split('|');
+                                if (medPartes.Length >= 2)
                                 {
-                                    if (string.IsNullOrWhiteSpace(med)) continue;
-
-                                    var medPartes = med.Split('|');
-                                    if (medPartes.Length >= 2)
+                                    string tipo = medPartes[0].Trim().ToUpper();
+                                    
+                                    if (currentTipos.Contains(tipo))
                                     {
-                                        string tipo = medPartes[0].Trim();
-                                        
-                                        if (currentTipos.Contains(tipo))
-                                        {
-                                            LogDataLocally($"DATA|{currentSensorId}|{medPartes[2]}|{tipo}|{medPartes[1]}");
+                                        GuardarHistorico($"DATA|{currentSensorId}|{medPartes[2]}|{tipo}|{medPartes[1]}");
 
-                                            lock (lockBuffer)
-                                            {
-                                                _dataBuffer.Add($"DATA|{currentSensorId}|{medPartes[2]}|{tipo}|{medPartes[1]}");
-                                            }
+                                        lock (lockBuffer)
+                                        {
+                                            _dataBuffer.Add($"DATA|{currentSensorId}|{medPartes[2]}|{tipo}|{medPartes[1]}");
                                         }
-                                    }
-                                }
-
-                                UpdateSensorEntry(currentSensorId, "ativo");
-                                writer.WriteLine("LOTE_ACK|SUCESSO");
-                                writer.Flush();
-                                Console.WriteLine($"[LOTE] ✓ Lote processado com sucesso");
-
-                                // Verificar se precisa enviar ao servidor
-                                lock (lockBuffer)
-                                {
-                                    if (_dataBuffer.Count >= MAX_BATCH_SIZE)
-                                    {
-                                        Thread envioThread = new Thread(ForwardBatchToServer)
-                                        {
-                                            Name = $"EnvioBatch-{DateTime.Now:HHmmss}",
-                                            IsBackground = true
-                                        };
-                                        envioThread.Start();
+                                        
+                                        processadas++;
                                     }
                                 }
                             }
-                            catch (Exception ex)
+
+                            lock (lockEstado)
                             {
-                                Console.WriteLine($"[LOTE] ✗ Erro ao processar lote: {ex.Message}");
-                                writer.WriteLine("LOTE_ACK|ERRO");
-                                writer.Flush();
+                                estadoSensores[currentSensorId].UltimoSync = DateTime.Now;
+                                estadoSensores[currentSensorId].UltimoHeartbeat = DateTime.Now;
+                                CarregarEstadosPersistidos();
+                                GuardarEstadoSensor(currentSensorId);
                             }
+
+                            Console.WriteLine($"[GATEWAY] 📦 Lote de {processadas} medições recebido de {currentSensorId}");
+                            writer.WriteLine("LOTE_ACK|SUCESSO");
+                            writer.Flush();
+
+                            lock (lockBuffer)
+                            {
+                                if (_dataBuffer.Count >= MAX_BATCH_SIZE)
+                                {
+                                    Thread envioThread = new Thread(EnviarLoteAoServidor)
+                                    {
+                                        Name = $"EnvioBatch-{DateTime.Now:HHmmss}",
+                                        IsBackground = true
+                                    };
+                                    envioThread.Start();
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"[GATEWAY] ✗ Erro ao processar lote: {ex.Message}");
+                            writer.WriteLine("LOTE_ACK|ERRO");
+                            writer.Flush();
                         }
                         break;
 
                     case "HEARTBEAT":
-                        if (isConnected && currentSensorId != null)
+                        if (!isConnected || currentSensorId == null)
                         {
-                            UpdateSensorEntry(currentSensorId, "ativo");
-                            writer.WriteLine("ACK_HEARTBEAT|SUCESSO");
+                            writer.WriteLine("ACK_HEARTBEAT|ERRO");
                             writer.Flush();
+                            break;
                         }
+
+                        lock (lockEstado)
+                        {
+                            estadoSensores[currentSensorId].UltimoHeartbeat = DateTime.Now;
+                            CarregarEstadosPersistidos();
+                            GuardarEstadoSensor(currentSensorId);
+                        }
+
+                        writer.WriteLine("ACK_HEARTBEAT|SUCESSO");
+                        writer.Flush();
                         break;
 
                     case "NOTIFY":
-                        if (parts.Length >= 4 && parts[3] == "LOW_BATTERY")
+                        if (!isConnected || currentSensorId == null)
                         {
-                            Console.WriteLine($"[ALERTA] Bateria Baixa no Sensor {parts[1]}: {parts[2]}");
-                            UpdateSensorEntry(parts[1], "manutencao");
+                            writer.WriteLine("ACK_NOTIFY|ERRO");
+                            writer.Flush();
+                            break;
                         }
+
+                        if (parts.Length >= 4)
+                        {
+                            if (parts[3] == "LOW_BATTERY")
+                            {
+                                lock (lockEstado)
+                                {
+                                    estadoSensores[currentSensorId].Bateria = int.Parse(parts[4] ?? "20"); // NOVO
+                                    estadoSensores[currentSensorId].Estado = "manutencao";
+                                    GuardarEstadoSensor(currentSensorId);
+                                }
+
+                                Console.WriteLine($"[GATEWAY] ⚠️  Bateria baixa em {currentSensorId}: {estadoSensores[currentSensorId].Bateria}%");
+                            }
+                        }
+
                         writer.WriteLine("ACK_NOTIFY|SUCESSO");
                         writer.Flush();
                         break;
 
-                    case "DISCONNECT": // --- CORREÇÃO: RECEBER DESLIGAMENTO ---
+                    case "DISCONNECT":
                         if (isConnected && currentSensorId != null)
                         {
-                            Console.WriteLine($"[DESLIGAR] Sensor {currentSensorId} solicitou o encerramento da ligação.");
+                            Console.WriteLine($"[GATEWAY] 👋 Sensor {currentSensorId} desconectado");
+                            
+                            lock (lockEstado)
+                            {
+                                estadoSensores[currentSensorId].Estado = "offline";
+                                GuardarEstadoSensor(currentSensorId);
+                            }
+
                             writer.WriteLine("ACK_DISCONNECT|SUCESSO");
                             writer.Flush();
-                            return; // Encerra a comunicação com este sensor
                         }
+                        return;
+
+                    case "VIDEO":
+                        if (!isConnected || currentSensorId == null)
+                        {
+                            writer.WriteLine("VIDEO_ACK|ERRO");
+                            writer.Flush();
+                            break;
+                        }
+
+                        Console.WriteLine($"[GATEWAY] 🎥 Pedido de stream de vídeo do sensor {currentSensorId}");
+                        writer.WriteLine("VIDEO_ACK|ENCAMINHADO_SERVIDOR");
+                        writer.Flush();
                         break;
                 }
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[GATEWAY] Erro na ligação: {ex.Message}");
+            Console.WriteLine($"[GATEWAY] ✗ Erro na ligação: {ex.Message}");
         }
     }
 }
 
-void ForwardBatchToServer()
+void EnviarLoteAoServidor()
 {
     lock (lockBuffer)
     {
@@ -305,13 +457,13 @@ void ForwardBatchToServer()
                 sw.Flush();
 
                 string? ack = sr.ReadLine();
-                Console.WriteLine($"[BATCH] Lote de {batch.Count} enviado. Resposta do servidor: {ack}");
+                Console.WriteLine($"[GATEWAY] 📤 Lote de {batch.Count} enviado ao servidor");
             }
             server.Close();
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ERRO] Servidor offline. Dados mantidos no histórico local. {ex.Message}");
+            Console.WriteLine($"[GATEWAY] ⚠️  Servidor offline. Dados no histórico local.");
         }
     }
 }
@@ -323,11 +475,55 @@ void BatchTimerLoop()
         try
         {
             Thread.Sleep(BATCH_TIMEOUT_MS);
-            ForwardBatchToServer();
+            
+            lock (lockBuffer)
+            {
+                if (_dataBuffer.Count > 0)
+                {
+                    Console.WriteLine($"[GATEWAY] ⏱ Timeout atingido - Enviando {_dataBuffer.Count} medições...");
+                    EnviarLoteAoServidor();
+                }
+            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[BATCH] Erro no timer: {ex.Message}");
+            Console.WriteLine($"[GATEWAY] ✗ Erro no timer: {ex.Message}");
+        }
+    }
+}
+
+void MonitorizarHeartbeats()
+{
+    while (gatewayEmExecucao)
+    {
+        try
+        {
+            Thread.Sleep(10000);
+
+            lock (lockEstado)
+            {
+                foreach (var kvp in estadoSensores)
+                {
+                    var sensor = kvp.Value;
+                    
+                    if (sensor.Estado == "ativo")
+                    {
+                        var tempoSemHeartbeat = (DateTime.Now - sensor.UltimoHeartbeat).TotalSeconds;
+                        
+                        if (tempoSemHeartbeat > HEARTBEAT_TIMEOUT_SECONDS)
+                        {
+                            Console.WriteLine($"[GATEWAY] ⚠️  Sensor {sensor.SensorId} sem resposta ({tempoSemHeartbeat:F0}s)");
+                            sensor.Estado = "timeout";
+                            CarregarEstadosPersistidos();
+                            GuardarEstadoSensor(sensor.SensorId);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[GATEWAY] ✗ Erro na monitorização: {ex.Message}");
         }
     }
 }
@@ -339,99 +535,397 @@ void ManualCommandLoop()
         try
         {
             string? cmd = Console.ReadLine();
-            if (cmd?.ToLower() == "send")
+            
+            if (string.IsNullOrEmpty(cmd)) continue;
+
+            if (cmd.ToLower() == "send")
             {
-                Console.WriteLine("[MANUAL] A forçar envio do lote...");
-                ForwardBatchToServer();
+                Console.WriteLine("[GATEWAY] 📤 Forçando envio do lote...");
+                EnviarLoteAoServidor();
+            }
+            else if (cmd.ToLower() == "status")
+            {
+                Console.WriteLine("\n===== ESTADO DOS SENSORES =====");
+                lock (lockEstado)
+                {
+                    foreach (var kvp in estadoSensores)
+                    {
+                        var sensor = kvp.Value;
+                        Console.WriteLine($"\n{sensor.SensorId} - {sensor.Zona}");
+                        Console.WriteLine($"  Estado: {sensor.Estado}");
+                        Console.WriteLine($"  Bateria: {sensor.Bateria}%");
+                        Console.WriteLine($"  Medições: {sensor.TotalMedicoes}");
+                        Console.WriteLine($"  Último sync: {sensor.UltimoSync:yyyy-MM-dd HH:mm:ss}");
+                        Console.WriteLine($"  Último heartbeat: {sensor.UltimoHeartbeat:yyyy-MM-dd HH:mm:ss}");
+                    }
+                }
+                Console.WriteLine("================================\n");
+            }
+            else if (cmd.ToLower() == "pedidos")
+            {
+                MostrarPedidosPendentes();
+            }
+            else if (cmd.ToLower().StartsWith("aceitar "))
+            {
+                string sensorId = cmd.Substring(8).Trim();
+                AceitarSensor(sensorId);
+            }
+            else if (cmd.ToLower().StartsWith("rejeitar "))
+            {
+                string sensorId = cmd.Substring(9).Trim();
+                RejeitarSensor(sensorId);
             }
         }
-        catch (Exception ex)
+        catch { }
+    }
+}
+
+void MostrarPedidosPendentes()
+{
+    lock (lockPedidos)
+    {
+        if (pedidosPendentes.Count == 0)
         {
-            Console.WriteLine($"[COMMAND] Erro: {ex.Message}");
+            Console.WriteLine("[GATEWAY] ℹ️  Nenhum pedido pendente\n");
+            return;
+        }
+
+        Console.WriteLine("\n===== PEDIDOS PENDENTES =====");
+        foreach (var pedido in pedidosPendentes.Where(p => p.Status == "pendente"))
+        {
+            Console.WriteLine($"• {pedido.SensorId} - Zona: {pedido.Zona} | Tipos: {pedido.TiposDados}");
+        }
+        Console.WriteLine("============================\n");
+    }
+}
+
+void AceitarSensor(string sensorId)
+{
+    lock (lockPedidos)
+    {
+        var pedido = pedidosPendentes.FirstOrDefault(p => p.SensorId == sensorId && p.Status == "pendente");
+        
+        if (pedido == null)
+        {
+            Console.WriteLine($"[GATEWAY] ⚠️  Nenhum pedido pendente para {sensorId}");
+            return;
+        }
+
+        // Adicionar à config
+        lock (lockConfig)
+        {
+            var novoSensor = new SensorRegistado
+            {
+                SensorId = pedido.SensorId,
+                Zona = pedido.Zona,
+                TiposDados = pedido.TiposDados
+            };
+
+            var novosSensores = gatewayConfig.SensoresRegistados.ToList();
+            novosSensores.Add(novoSensor);
+            gatewayConfig.SensoresRegistados = novosSensores.ToArray();
+
+            GuardarGatewayConfig();
+
+            // Adicionar ao dicionário de estado
+            estadoSensores[sensorId] = new SensorEstado
+            {
+                SensorId = sensorId,
+                Zona = pedido.Zona,
+                TiposDados = pedido.TiposDados.Split(',').Select(t => t.Trim()).ToList(),
+                Estado = "offline",
+                UltimoHeartbeat = DateTime.Now,
+                UltimoSync = DateTime.MinValue
+            };
+            CarregarEstadosPersistidos();
+            GuardarEstadoSensor(sensorId);
+
+            pedido.Status = "aceite";
+            GuardarPedidosPendentes();
+
+            Console.WriteLine($"[GATEWAY] ✅ Sensor {sensorId} aceite e registado!");
         }
     }
 }
 
-void UpdateSensorEntry(string id, string estado)
+void RejeitarSensor(string sensorId)
 {
-    lock (lockCsv)
+    lock (lockPedidos)
+    {
+        var pedido = pedidosPendentes.FirstOrDefault(p => p.SensorId == sensorId && p.Status == "pendente");
+        
+        if (pedido == null)
+        {
+            Console.WriteLine($"[GATEWAY] ⚠️  Nenhum pedido pendente para {sensorId}");
+            return;
+        }
+
+        pedido.Status = "rejeitado";
+        GuardarPedidosPendentes();
+        Console.WriteLine($"[GATEWAY] ❌ Sensor {sensorId} rejeitado");
+    }
+}
+
+void GuardarGatewayConfig()
+{
+    try
+    {
+        string json = JsonSerializer.Serialize(gatewayConfig, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(GATEWAY_CONFIG_FILE, json);
+        Console.WriteLine($"[GATEWAY] 💾 gateway_config.json atualizado");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[GATEWAY] ✗ Erro ao guardar configuração: {ex.Message}");
+    }
+}
+
+void GuardarEstadoSensor(string sensorId)
+{
+    try
+    {
+        // Construir o dicionário completo de todos os sensores
+        var estadosCentralizados = new
+        {
+            ultima_atualizacao = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss"),
+            sensores = estadoSensores.ToDictionary(
+                kvp => kvp.Key,
+                kvp => new
+                {
+                    sensor_id = kvp.Value.SensorId,
+                    zona = kvp.Value.Zona,
+                    tipos_dados = kvp.Value.TiposDados,
+                    estado = kvp.Value.Estado,
+                    bateria = kvp.Value.Bateria,
+                    ultimo_heartbeat = kvp.Value.UltimoHeartbeat.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    ultimo_sync = kvp.Value.UltimoSync.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    data_conexao = kvp.Value.DataConexao.ToString("yyyy-MM-ddTHH:mm:ss"),
+                    total_medicoes = kvp.Value.TotalMedicoes,
+                    erros_comunicacao = kvp.Value.ErrosComunicacao
+                }
+            )
+        };
+
+        string json = JsonSerializer.Serialize(estadosCentralizados, new JsonSerializerOptions { WriteIndented = true });
+        string caminhoArquivo = Path.Combine(ESTADO_DIR, "sensores_estado.json");
+        File.WriteAllText(caminhoArquivo, json);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[GATEWAY] ✗ Erro ao guardar estado: {ex.Message}");
+    }
+}
+
+// Carregar estado ao iniciar
+
+void CarregarEstadosPersistidos()
+{
+    try
+    {
+        string caminhoArquivo = Path.Combine(ESTADO_DIR, "sensores_estado.json");
+
+        if (!File.Exists(caminhoArquivo))
+        {
+            Console.WriteLine($"[GATEWAY] ℹ️  Nenhum estado persistido encontrado");
+            return;
+        }
+
+        string json = File.ReadAllText(caminhoArquivo);
+        var estadoCentral = JsonSerializer.Deserialize<JsonElement>(json);
+
+        if (estadoCentral.TryGetProperty("sensores", out var sensoresJson))
+        {
+            foreach (var sensorProp in sensoresJson.EnumerateObject())
+            {
+                string sensorId = sensorProp.Name;
+
+                if (!estadoSensores.ContainsKey(sensorId))
+                    continue;
+
+                var sensor = estadoSensores[sensorId];
+                var sensorData = sensorProp.Value;
+
+                // Carregar cada campo
+                if (sensorData.TryGetProperty("estado", out var estadoProp))
+                    sensor.Estado = estadoProp.GetString() ?? "offline";
+
+                if (sensorData.TryGetProperty("bateria", out var bateriaProp))
+                    sensor.Bateria = bateriaProp.GetInt32();
+
+                if (sensorData.TryGetProperty("ultimo_heartbeat", out var hbProp))
+                    if (DateTime.TryParse(hbProp.GetString(), out var hbTime))
+                        sensor.UltimoHeartbeat = hbTime;
+
+                if (sensorData.TryGetProperty("ultimo_sync", out var syncProp))
+                    if (DateTime.TryParse(syncProp.GetString(), out var syncTime))
+                        sensor.UltimoSync = syncTime;
+
+                if (sensorData.TryGetProperty("data_conexao", out var connProp))
+                    if (DateTime.TryParse(connProp.GetString(), out var connTime))
+                        sensor.DataConexao = connTime;
+
+                if (sensorData.TryGetProperty("total_medicoes", out var medProp))
+                    sensor.TotalMedicoes = medProp.GetInt32();
+
+                if (sensorData.TryGetProperty("erros_comunicacao", out var erroProp))
+                    sensor.ErrosComunicacao = erroProp.GetInt32();
+
+                Console.WriteLine($"[GATEWAY] ✓ Estado do sensor {sensorId} carregado (Bateria: {sensor.Bateria}%)");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[GATEWAY] ⚠️  Erro ao carregar estados: {ex.Message}");
+    }
+}
+
+// Atualizar inicialização dos sensores
+
+foreach (var sensor in gatewayConfig.SensoresRegistados)
+{
+    estadoSensores[sensor.SensorId] = new SensorEstado
+    {
+        SensorId = sensor.SensorId,
+        Zona = sensor.Zona,
+        TiposDados = sensor.TiposDados.Split(',').Select(t => t.Trim()).ToList(),
+        Estado = "offline",
+        Bateria = 100,
+        UltimoHeartbeat = DateTime.Now,
+        UltimoSync = DateTime.MinValue,
+        DataConexao = DateTime.MinValue,
+        TotalMedicoes = 0,
+        ErrosComunicacao = 0
+    };
+}
+
+
+void GuardarHistorico(string dados)
+{
+    lock (lockHistorico)
     {
         try
         {
-            var lines = File.ReadAllLines(CSV_FILE).ToList();
-            for (int i = 1; i < lines.Count; i++)
-            {
-                var p = lines[i].Split(';');
-                if (p[0].Trim().Equals(id, StringComparison.OrdinalIgnoreCase))
-                {
-                    p[1] = estado;
-                    p[4] = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
-                    lines[i] = string.Join(';', p);
-                    break;
-                }
-            }
-            File.WriteAllLines(CSV_FILE, lines);
+            File.AppendAllText(HISTORY_FILE, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {dados}{Environment.NewLine}");
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[CSV] Erro ao atualizar: {ex.Message}");
-        }
+        catch { }
     }
 }
 
-void LogDataLocally(string data)
+void GuardarPedidosPendentes()
 {
     try
     {
-        File.AppendAllText(HISTORY_FILE, $"[{DateTime.Now}] {data}{Environment.NewLine}");
+        string json = JsonSerializer.Serialize(pedidosPendentes, new JsonSerializerOptions { WriteIndented = true });
+        File.WriteAllText(PEDIDOS_PENDENTES_FILE, json);
     }
     catch { }
 }
 
-SensorInfo? FindSensor(string sensorId)
+void CarregarPedidosPendentes()
 {
     try
     {
-        if (!File.Exists(CSV_FILE)) return null;
-        var lines = File.ReadAllLines(CSV_FILE).Skip(1);
-        foreach (var line in lines)
+        if (File.Exists(PEDIDOS_PENDENTES_FILE))
         {
-            var p = line.Split(';');
-            if (p.Length >= 5 && p[0].Trim().Equals(sensorId, StringComparison.OrdinalIgnoreCase))
+            string json = File.ReadAllText(PEDIDOS_PENDENTES_FILE);
+            var pedidos = JsonSerializer.Deserialize<List<PedidoSensor>>(json);
+            if (pedidos != null)
             {
-                return new SensorInfo
-                {
-                    SensorId = p[0].Trim(),
-                    Estado = p[1].Trim().ToLower(),
-                    Zona = p[2].Trim(),
-                    TiposDados = p[3].Split(',').Select(t => t.Trim()).ToList()
-                };
+                pedidosPendentes = pedidos;
+                Console.WriteLine($"[GATEWAY] ✓ {pedidosPendentes.Count(p => p.Status == "pendente")} pedidos carregados");
             }
         }
     }
     catch { }
+}
+
+GatewayConfiguracao? CarregarGatewayConfig()
+{
+    try
+    {
+        if (File.Exists(GATEWAY_CONFIG_FILE))
+        {
+            string json = File.ReadAllText(GATEWAY_CONFIG_FILE);
+            return JsonSerializer.Deserialize<GatewayConfiguracao>(json);
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[GATEWAY] ✗ Erro ao ler configuração: {ex.Message}");
+    }
+
     return null;
 }
 
-void EnsureCsvExists()
+class GatewayConfiguracao
 {
-    if (!File.Exists(CSV_FILE))
-    {
-        File.WriteAllLines(CSV_FILE, new[] {
-            "sensor_id;estado;zona;tipos_dados;last_sync",
-            "S101;ativo;ZONA_PARQUE;TEMP,HUM,RUIDO;-",
-            "S102;ativo;ZONA_ESCOLAR;TEMP,PM2.5,RUIDO;-",
-            "S103;desativado;ZONA_CENTRO;TEMP,HUM;-",
-            "S104;ativo;ZONA_PASSEIO;TEMP,HUM,RUIDO;-",
-            "S105;ativo;ZONA_ESCOLAR;TEMP,HUM,RUIDO;-"
-        });
-    }
+    [JsonPropertyName("zonas_validas")]
+    public string[] ZonasValidas { get; set; } = Array.Empty<string>();
+
+    [JsonPropertyName("tipos_dados_suportados")]
+    public string[] TiposDadosSuportados { get; set; } = Array.Empty<string>();
+
+    [JsonPropertyName("sensores_registados")]
+    public SensorRegistado[] SensoresRegistados { get; set; } = Array.Empty<SensorRegistado>();
+
+    [JsonPropertyName("parametros_gateway")]
+    public ParametrosGateway ParametrosGateway { get; set; } = new();
 }
 
-class SensorInfo
+class SensorRegistado
+{
+    [JsonPropertyName("sensor_id")]
+    public string SensorId { get; set; } = "";
+
+    [JsonPropertyName("zona")]
+    public string Zona { get; set; } = "";
+
+    [JsonPropertyName("tipos_dados")]
+    public string TiposDados { get; set; } = "";
+}
+
+class ParametrosGateway
+{
+    [JsonPropertyName("max_batch_size")]
+    public int MaxBatchSize { get; set; } = 5;
+
+    [JsonPropertyName("batch_timeout_ms")]
+    public int BatchTimeoutMs { get; set; } = 300000;
+
+    [JsonPropertyName("heartbeat_timeout_seconds")]
+    public int HeartbeatTimeoutSeconds { get; set; } = 60;
+}
+
+class SensorEstado
 {
     public string SensorId { get; set; } = "";
-    public string Estado { get; set; } = "";
     public string Zona { get; set; } = "";
     public List<string> TiposDados { get; set; } = new();
+    public string Estado { get; set; } = "offline";
+    public int Bateria { get; set; } = 100;
+    public DateTime UltimoHeartbeat { get; set; }
+    public DateTime UltimoSync { get; set; }
+    public DateTime DataConexao { get; set; }
+    public int TotalMedicoes { get; set; } = 0;
+    public int ErrosComunicacao { get; set; } = 0;
+}
+
+
+class PedidoSensor
+{
+    [JsonPropertyName("sensor_id")]
+    public string SensorId { get; set; } = "";
+
+    [JsonPropertyName("zona")]
+    public string Zona { get; set; } = "";
+
+    [JsonPropertyName("tipos_dados")]
+    public string TiposDados { get; set; } = "";
+
+    [JsonPropertyName("data_pedido")]
+    public DateTime DataPedido { get; set; }
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "pendente"; // pendente, aceite, rejeitado
 }

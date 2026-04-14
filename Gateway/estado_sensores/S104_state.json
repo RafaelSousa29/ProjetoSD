@@ -1,0 +1,10 @@
+{
+  "SensorId": "S104",
+  "Zona": "ZONA_CENTRO",
+  "TiposDados": [
+    "LUZ"
+  ],
+  "Estado": "offline",
+  "UltimoHeartbeat": "2026-04-13T21:47:03.4106544+01:00",
+  "UltimoSync": "0001-01-01T00:00:00"
+}

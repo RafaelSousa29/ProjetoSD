@@ -1,0 +1,12 @@
+{
+  "SensorId": "S101",
+  "Zona": "ZONA_PARQUE",
+  "TiposDados": [
+    "TEMP",
+    "HUM",
+    "RUIDO"
+  ],
+  "Estado": "offline",
+  "UltimoHeartbeat": "2026-04-13T21:47:25.4016047+01:00",
+  "UltimoSync": "2026-04-13T21:47:25.4016027+01:00"
+}

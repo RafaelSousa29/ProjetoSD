@@ -1,0 +1,51 @@
+{
+  "ultima_atualizacao": "2026-04-14T10:57:40",
+  "sensores": {
+    "S101": {
+      "sensor_id": "S101",
+      "zona": "ZONA_PARQUE",
+      "tipos_dados": [
+        "TEMP",
+        "HUM",
+        "RUIDO"
+      ],
+      "estado": "offline",
+      "bateria": 100,
+      "ultimo_heartbeat": "2026-04-14T10:54:40",
+      "ultimo_sync": "0001-01-01T00:00:00",
+      "data_conexao": "0001-01-01T00:00:00",
+      "total_medicoes": 0,
+      "erros_comunicacao": 0
+    },
+    "S102": {
+      "sensor_id": "S102",
+      "zona": "ZONA_ESCOLAR",
+      "tipos_dados": [
+        "TEMP",
+        "PM2.5",
+        "RUIDO"
+      ],
+      "estado": "offline",
+      "bateria": 100,
+      "ultimo_heartbeat": "2026-04-14T10:54:40",
+      "ultimo_sync": "0001-01-01T00:00:00",
+      "data_conexao": "0001-01-01T00:00:00",
+      "total_medicoes": 0,
+      "erros_comunicacao": 0
+    },
+    "S104": {
+      "sensor_id": "S104",
+      "zona": "ZONA_CENTRO",
+      "tipos_dados": [
+        "LUZ"
+      ],
+      "estado": "offline",
+      "bateria": 100,
+      "ultimo_heartbeat": "2026-04-14T10:54:40",
+      "ultimo_sync": "0001-01-01T00:00:00",
+      "data_conexao": "0001-01-01T00:00:00",
+      "total_medicoes": 0,
+      "erros_comunicacao": 0
+    }
+  }
+}
