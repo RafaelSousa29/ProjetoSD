@@ -9,6 +9,7 @@ const int SERVER_PORT = 6000;
 const string GATEWAY_ID = "GW01";
 const string CSV_FILE = "sensors.csv";
 const string HISTORY_FILE = "gateway_history.txt";
+const string SENSOR_PROFILES_RELATIVE_PATH = "..\\Sensor\\profiles";
 const int MAX_BATCH_SIZE = 20;
 const int BATCH_TIMEOUT_MS = 300000;
 const int SENSOR_TIMEOUT_MS = 30000;
@@ -17,6 +18,7 @@ const string STATE_ACTIVE = "ativo";
 const string STATE_MAINTENANCE = "manutencao";
 const string STATE_DISABLED = "desativado";
 const string STATE_INACTIVE = "inativo";
+string[] SUPPORTED_DATA_TYPES = ["TEMP", "HUM", "RUIDO", "PM2.5", "PM10", "LUM", "AQ"];
 
 List<string> dataBuffer = new();
 Lock dataBufferLock = new();
@@ -35,7 +37,7 @@ TcpListener listener = new(IPAddress.Any, GATEWAY_PORT);
 listener.Start();
 
 Console.WriteLine($"[GATEWAY {GATEWAY_ID}] Ativo na porta {GATEWAY_PORT}...");
-Console.WriteLine("Comandos disponíveis: 'send' para forçar envio do lote e 'status' para listar sensores.");
+Console.WriteLine("Comandos disponíveis: 'send' para forçar envio do lote, 'status' para listar sensores, 'create' para criar um novo sensor e 'state' para alterar o estado.");
 
 _ = Task.Run(BatchTimerLoop);
 _ = Task.Run(ManualCommandLoop);
@@ -325,7 +327,8 @@ async Task ForwardBatchToServerAsync()
                 return;
             }
 
-            batch = new List<string>(dataBuffer);
+            int countToSend = Math.Min(MAX_BATCH_SIZE, dataBuffer.Count);
+            batch = dataBuffer.Take(countToSend).ToList();
         }
 
         string msg = $"DATA_BATCH|{GATEWAY_ID}|{batch.Count}|{string.Join("#", batch)}";
@@ -408,6 +411,14 @@ async Task ManualCommandLoop()
             {
                 Console.WriteLine($"[STATUS] {sensor.SensorId} | {sensor.Estado} | {sensor.Zona} | {sensor.LastSync}");
             }
+        }
+        else if (cmd == "create")
+        {
+            CreateSensorInteractive();
+        }
+        else if (cmd == "state")
+        {
+            ChangeSensorStateInteractive();
         }
     }
 }
@@ -600,7 +611,9 @@ SensorInfo? ParseSensorInfo(string line)
         Estado = p[1].Trim().ToLowerInvariant(),
         Zona = p[2].Trim(),
         TiposDados = p[3]
+            .Trim().Trim('"')
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(tipo => tipo.Trim().Trim('"'))
             .ToList(),
         LastSync = p[4].Trim()
     };
@@ -622,6 +635,143 @@ void EnsureCsvExists()
         "S104;ativo;ZONA_PASSEIO;TEMP,HUM,RUIDO;-",
         "S105;ativo;ZONA_ESCOLAR;TEMP,HUM,RUIDO;-"
     });
+}
+
+void CreateSensorInteractive()
+{
+    Console.Write("Novo ID do sensor: ");
+    string sensorId = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+
+    if (string.IsNullOrWhiteSpace(sensorId))
+    {
+        Console.WriteLine("[CREATE] ID inválido.");
+        return;
+    }
+
+    if (FindSensor(sensorId) != null)
+    {
+        Console.WriteLine($"[CREATE] Já existe um sensor com o ID {sensorId}.");
+        return;
+    }
+
+    Console.Write("Zona: ");
+    string zona = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+    if (string.IsNullOrWhiteSpace(zona))
+    {
+        Console.WriteLine("[CREATE] Zona inválida.");
+        return;
+    }
+
+    Console.WriteLine($"Tipos suportados pelo protocolo: {string.Join(", ", SUPPORTED_DATA_TYPES)}");
+    Console.Write("Tipos de dados do sensor (separados por vírgula): ");
+    string tiposInput = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+    List<string> tipos = tiposInput
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(tipo => tipo.ToUpperInvariant())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    if (tipos.Count == 0)
+    {
+        Console.WriteLine("[CREATE] Tens de indicar pelo menos um tipo de dado.");
+        return;
+    }
+
+    List<string> invalidTypes = tipos
+        .Where(tipo => !SUPPORTED_DATA_TYPES.Contains(tipo, StringComparer.OrdinalIgnoreCase))
+        .ToList();
+
+    if (invalidTypes.Count > 0)
+    {
+        Console.WriteLine($"[CREATE] Tipos inválidos: {string.Join(", ", invalidTypes)}");
+        Console.WriteLine($"[CREATE] Tipos permitidos: {string.Join(", ", SUPPORTED_DATA_TYPES)}");
+        return;
+    }
+
+    Console.Write("Estado inicial [ativo/manutencao/desativado] (Enter para 'ativo'): ");
+    string estadoInput = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+    string estado = string.IsNullOrWhiteSpace(estadoInput) ? STATE_ACTIVE : estadoInput;
+
+    if (estado != STATE_ACTIVE && estado != STATE_MAINTENANCE && estado != STATE_DISABLED)
+    {
+        Console.WriteLine("[CREATE] Estado inválido.");
+        return;
+    }
+
+    AddSensorToCsv(sensorId, estado, zona, tipos);
+    CreateSensorProfile(sensorId, zona, tipos);
+
+    Console.WriteLine($"[CREATE] Sensor {sensorId} criado com sucesso.");
+}
+
+void AddSensorToCsv(string sensorId, string estado, string zona, List<string> tipos)
+{
+    lock (csvLock)
+    {
+        string line = string.Join(';', new[]
+        {
+            sensorId,
+            estado,
+            zona,
+            string.Join(',', tipos),
+            "-"
+        });
+
+        File.AppendAllLines(CSV_FILE, new[] { line });
+    }
+}
+
+void ChangeSensorStateInteractive()
+{
+    Console.Write("ID do sensor a alterar: ");
+    string sensorId = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+
+    SensorInfo? sensor = FindSensor(sensorId);
+    if (sensor == null)
+    {
+        Console.WriteLine($"[STATE] Sensor {sensorId} não encontrado.");
+        return;
+    }
+
+    Console.WriteLine($"[STATE] Estado atual de {sensorId}: {sensor.Estado}");
+    Console.Write("Novo estado [ativo/manutencao/desativado/inativo]: ");
+    string newState = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+
+    if (newState != STATE_ACTIVE &&
+        newState != STATE_MAINTENANCE &&
+        newState != STATE_DISABLED &&
+        newState != STATE_INACTIVE)
+    {
+        Console.WriteLine("[STATE] Estado inválido.");
+        return;
+    }
+
+    UpdateSensorEntry(sensorId, newState, DateTime.UtcNow);
+    sensorStatusReasons[sensorId] = $"Estado alterado manualmente para {newState}.";
+
+    if (newState == STATE_INACTIVE || newState == STATE_DISABLED)
+    {
+        lastSeenUtc.TryRemove(sensorId, out _);
+        heartbeatCounters.TryRemove(sensorId, out _);
+    }
+
+    Console.WriteLine($"[STATE] Sensor {sensorId} atualizado para {newState}.");
+}
+
+void CreateSensorProfile(string sensorId, string zona, List<string> tipos)
+{
+    string profilesDirectory = Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, SENSOR_PROFILES_RELATIVE_PATH));
+    Directory.CreateDirectory(profilesDirectory);
+
+    string profilePath = Path.Combine(profilesDirectory, $"{sensorId}.txt");
+    File.WriteAllLines(profilePath, new[]
+    {
+        $"sensor_id={sensorId}",
+        $"zona={zona}",
+        $"tipos_dados={string.Join(',', tipos)}"
+    });
+
+    Console.WriteLine($"[CREATE] Perfil criado em {profilePath}");
 }
 
 class SensorInfo

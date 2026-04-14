@@ -68,6 +68,9 @@ async Task HandleGatewayAsync(TcpClient client)
                 }
 
                 bool success = true;
+                Dictionary<string, int> updatedTypes = new(StringComparer.OrdinalIgnoreCase);
+
+                Console.WriteLine($"[SERVIDOR] Lote recebido de {gatewayId}: {expectedCount} medições.");
 
                 foreach (string medicao in medicoes)
                 {
@@ -81,12 +84,22 @@ async Task HandleGatewayAsync(TcpClient client)
                     try
                     {
                         await GravarDadosAsync(gatewayId, p[1], p[2], p[3], p[4]);
+                        string normalizedType = p[3].Trim().ToUpperInvariant();
+                        updatedTypes[normalizedType] = updatedTypes.GetValueOrDefault(normalizedType) + 1;
                     }
                     catch (Exception ex)
                     {
                         success = false;
                         Console.WriteLine($"[SERVIDOR] Erro ao gravar medição: {ex.Message}");
                         break;
+                    }
+                }
+
+                if (success)
+                {
+                    foreach (KeyValuePair<string, int> entry in updatedTypes)
+                    {
+                        Console.WriteLine($"[SERVIDOR] {entry.Key}.txt atualizado ({entry.Value} registos).");
                     }
                 }
 
@@ -113,7 +126,6 @@ async Task GravarDadosAsync(string gatewayId, string sensorId, string timestamp,
     {
         string logEntry = $"{timestamp} | Gateway: {gatewayId} | Sensor: {sensorId} | Valor: {valor}";
         File.AppendAllText(fileName, logEntry + Environment.NewLine);
-        Console.WriteLine($"[FICHEIRO] {fileName} atualizado.");
     }
     finally
     {

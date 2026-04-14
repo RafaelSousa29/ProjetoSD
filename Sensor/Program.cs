@@ -6,7 +6,7 @@ using System.Threading;
 const string GATEWAY_IP = "127.0.0.1";
 const int GATEWAY_PORT = 5000;
 const int HEARTBEAT_INTERVAL_MS = 10000;
-const int BATTERY_DRAIN_INTERVAL_MS = 15000;
+const int BATTERY_DRAIN_INTERVAL_MS = 45000;
 const int BATTERY_CHARGE_INTERVAL_MS = 5000;
 const int LOW_BATTERY_THRESHOLD = 20;
 const int HEARTBEAT_BATTERY_COST = 1;
@@ -14,6 +14,10 @@ const int DATA_BATTERY_COST = 3;
 const int IDLE_BATTERY_COST = 1;
 const int CHARGE_STEP = 10;
 const string PROFILES_FOLDER = "profiles";
+const string STATE_FOLDER = "state";
+const string REASON_OK = "Operacional";
+const string REASON_LOW_BATTERY = "Bateria fraca";
+const string REASON_CHARGING = "A carregar";
 
 SensorConfig config = ReadStartupConfig();
 string sensorId = config.SensorId;
@@ -35,15 +39,21 @@ bool aCarregar = false;
 bool lowBatteryAlertSent = false;
 bool autoSendEnabled = false;
 bool resumeAutoSendAfterCharging = false;
+bool restoreAutoSendOnStartup = false;
 int heartbeatCount = 0;
 int batteryLevel = 100;
 int autoSendIntervalSeconds = 60;
 int autoSendCycleCount = 0;
 Task? chargingTask = null;
+DateTime nextAutoSendUtc = DateTime.MaxValue;
+string maintenanceReason = REASON_OK;
 
 Lock batteryLock = new();
 Lock autoSendLock = new();
 SemaphoreSlim socketLock = new(1, 1);
+SemaphoreSlim autoSendRoundLock = new(1, 1);
+
+LoadSensorState();
 
 try
 {
@@ -63,16 +73,37 @@ try
     if (response == "CONN_ACK|ACEITE")
     {
         ligado = true;
-        modoManutencao = false;
-        heartbeatAtivo = true;
+        modoManutencao = batteryLevel <= LOW_BATTERY_THRESHOLD;
+        heartbeatAtivo = !modoManutencao;
         Console.WriteLine("[SENSOR] Ligação aceite em modo normal.");
-        _ = Task.Run(HeartbeatLoop);
+        if (modoManutencao)
+        {
+            maintenanceReason = REASON_LOW_BATTERY;
+            Console.WriteLine($"[SENSOR] Arranque em manutenção por bateria a {batteryLevel}%.");
+            _ = Task.Run(() => TrySendNotificationAsync("LOW_BATTERY", $"{batteryLevel}%"));
+        }
+        else
+        {
+            maintenanceReason = REASON_OK;
+            _ = Task.Run(HeartbeatLoop);
+            if (restoreAutoSendOnStartup)
+            {
+                SetAutoSendEnabled(true);
+                Console.WriteLine($"[SENSOR] Envio automático restaurado no arranque com intervalo de {GetAutoSendIntervalSeconds()} segundos.");
+                ScheduleNextAutoSend(immediate: false);
+                _ = Task.Run(() => RunAutoSendRoundAsync("arranque"));
+            }
+        }
     }
     else if (response == "CONN_ACK|MANUTENCAO")
     {
         ligado = true;
         modoManutencao = true;
         heartbeatAtivo = false;
+        if (batteryLevel <= LOW_BATTERY_THRESHOLD)
+        {
+            maintenanceReason = REASON_LOW_BATTERY;
+        }
         Console.WriteLine("[SENSOR] Ligação aceite em modo manutenção.");
     }
     else
@@ -96,7 +127,9 @@ while (true)
     Console.WriteLine();
     Console.WriteLine("===== SENSOR =====");
     Console.WriteLine($"Bateria: {GetBatteryLevel()}%");
-    Console.WriteLine($"Estado: {(aCarregar ? "a carregar" : modoManutencao ? "manutenção" : "normal")}");
+    Console.WriteLine($"Estado: {GetDisplayedState()}");
+    Console.WriteLine($"Carregamento: {(aCarregar ? "sim" : "não")}");
+    Console.WriteLine($"Motivo: {maintenanceReason}");
     Console.WriteLine($"Envio automático: {(IsAutoSendEnabled() ? $"ativo ({GetAutoSendIntervalSeconds()}s)" : "desativado")}");
     Console.WriteLine($"Tipos configurados: {string.Join(", ", configuredDataTypes)}");
     Console.WriteLine("1 - Enviar medição manual");
@@ -213,6 +246,7 @@ async Task EnviarMedicaoAsync(string tipo, string valor, bool origemAutomatica)
         {
             ConsumeBattery(DATA_BATTERY_COST);
             shouldCheckLowBattery = true;
+            SaveSensorState();
         }
     }
     finally
@@ -236,10 +270,23 @@ void ToggleAutoSend()
 
     bool newState = !IsAutoSendEnabled();
     SetAutoSendEnabled(newState);
+    if (!newState)
+    {
+        resumeAutoSendAfterCharging = false;
+        ClearNextAutoSend();
+    }
 
     Console.WriteLine(newState
         ? $"[SENSOR] Envio automático ativado com intervalo de {GetAutoSendIntervalSeconds()} segundos."
         : "[SENSOR] Envio automático desativado.");
+
+    if (newState)
+    {
+        ScheduleNextAutoSend(immediate: false);
+        _ = Task.Run(() => RunAutoSendRoundAsync("manual"));
+    }
+
+    SaveSensorState();
 }
 
 void ConfigureAutoSendInterval()
@@ -255,6 +302,13 @@ void ConfigureAutoSendInterval()
 
     SetAutoSendIntervalSeconds(seconds);
     Console.WriteLine($"[SENSOR] Intervalo de envio automático definido para {seconds} segundos.");
+
+    if (IsAutoSendEnabled())
+    {
+        ScheduleNextAutoSend(immediate: false);
+    }
+
+    SaveSensorState();
 }
 
 async Task AutoSendLoop()
@@ -263,35 +317,12 @@ async Task AutoSendLoop()
     {
         await Task.Delay(500);
 
-        if (!ligado || !IsAutoSendEnabled() || aCarregar || modoManutencao)
+        if (!ligado || !IsAutoSendEnabled() || aCarregar || modoManutencao || !ShouldRunAutoSendNow())
         {
             continue;
         }
 
-        int intervalSeconds = GetAutoSendIntervalSeconds();
-        await Task.Delay(TimeSpan.FromSeconds(intervalSeconds));
-
-        if (!ligado || !IsAutoSendEnabled() || aCarregar || modoManutencao)
-        {
-            continue;
-        }
-
-        autoSendCycleCount++;
-        Console.WriteLine($"[AUTO] Início da ronda {autoSendCycleCount}.");
-
-        foreach (string dataType in configuredDataTypes)
-        {
-            if (!ligado || !IsAutoSendEnabled() || aCarregar || modoManutencao)
-            {
-                break;
-            }
-
-            string generatedValue = SensorDataGenerator.Generate(dataType);
-            Console.WriteLine($"[AUTO] {dataType}={generatedValue}");
-            await EnviarMedicaoAsync(dataType, generatedValue, origemAutomatica: true);
-        }
-
-        Console.WriteLine($"[AUTO] Fim da ronda {autoSendCycleCount}.");
+        await RunAutoSendRoundAsync("intervalo");
     }
 }
 
@@ -312,8 +343,11 @@ Task IniciarCarregamento()
     aCarregar = true;
     modoManutencao = true;
     heartbeatAtivo = false;
-    resumeAutoSendAfterCharging = IsAutoSendEnabled();
+    maintenanceReason = REASON_CHARGING;
+    RememberAutoSendPreference();
     SetAutoSendEnabled(false);
+    ClearNextAutoSend();
+    SaveSensorState();
 
     Console.WriteLine("[SENSOR] Carregamento iniciado.");
     _ = Task.Run(() => TrySendNotificationAsync("CHARGING", "INICIADO"));
@@ -341,6 +375,7 @@ async Task ChargingLoop()
             currentLevel = batteryLevel;
             completed = batteryLevel >= 100;
         }
+        SaveSensorState();
 
         Console.WriteLine($"[SENSOR] A carregar... bateria a {currentLevel}%.");
 
@@ -350,8 +385,10 @@ async Task ChargingLoop()
             modoManutencao = false;
             lowBatteryAlertSent = false;
             heartbeatAtivo = true;
+            maintenanceReason = REASON_OK;
             bool restoreAutoSend = resumeAutoSendAfterCharging;
             resumeAutoSendAfterCharging = false;
+            SaveSensorState();
 
             Console.WriteLine("[SENSOR] Carregamento concluído. Sensor novamente ativo.");
             _ = Task.Run(() => TrySendNotificationAsync("CHARGING", "COMPLETO"));
@@ -360,6 +397,8 @@ async Task ChargingLoop()
             {
                 SetAutoSendEnabled(true);
                 Console.WriteLine($"[SENSOR] Envio automático restaurado com intervalo de {GetAutoSendIntervalSeconds()} segundos.");
+                ScheduleNextAutoSend(immediate: false);
+                _ = Task.Run(() => RunAutoSendRoundAsync("restauro"));
             }
         }
     }
@@ -382,7 +421,9 @@ async Task HeartbeatLoop()
             {
                 heartbeatAtivo = false;
                 modoManutencao = true;
+                RememberAutoSendPreference();
                 SetAutoSendEnabled(false);
+                ClearNextAutoSend();
                 Console.WriteLine("[SENSOR] Heartbeat parado por bateria esgotada.");
                 continue;
             }
@@ -407,6 +448,7 @@ async Task HeartbeatLoop()
                 {
                     ConsumeBattery(HEARTBEAT_BATTERY_COST);
                     shouldCheckLowBattery = true;
+                    SaveSensorState();
 
                     if (heartbeatCount % 10 == 0)
                     {
@@ -444,6 +486,7 @@ async Task BatteryDrainLoop()
         }
 
         ConsumeBattery(IDLE_BATTERY_COST);
+        SaveSensorState();
         await CheckLowBatteryAsync();
     }
 }
@@ -455,6 +498,11 @@ async Task CheckLowBatteryAsync()
     if (currentBattery > LOW_BATTERY_THRESHOLD)
     {
         lowBatteryAlertSent = false;
+        if (!aCarregar && !modoManutencao)
+        {
+            maintenanceReason = REASON_OK;
+        }
+        SaveSensorState();
         return;
     }
 
@@ -464,7 +512,11 @@ async Task CheckLowBatteryAsync()
         {
             modoManutencao = true;
             heartbeatAtivo = false;
+            RememberAutoSendPreference();
             SetAutoSendEnabled(false);
+            ClearNextAutoSend();
+            maintenanceReason = REASON_LOW_BATTERY;
+            SaveSensorState();
             Console.WriteLine("[SENSOR] Bateria esgotada. O sensor precisa de carregamento.");
         }
         return;
@@ -472,8 +524,12 @@ async Task CheckLowBatteryAsync()
 
     modoManutencao = true;
     heartbeatAtivo = false;
+    RememberAutoSendPreference();
     SetAutoSendEnabled(false);
+    ClearNextAutoSend();
     lowBatteryAlertSent = true;
+    maintenanceReason = REASON_LOW_BATTERY;
+    SaveSensorState();
 
     Console.WriteLine($"[SENSOR] Bateria baixa ({currentBattery}%). A notificar o gateway.");
     await SendNotificationAsync("LOW_BATTERY", $"{currentBattery}%");
@@ -482,6 +538,163 @@ async Task CheckLowBatteryAsync()
     {
         Console.WriteLine("[SENSOR] Bateria esgotada. O sensor precisa de carregamento.");
     }
+}
+
+async Task RunAutoSendRoundAsync(string source)
+{
+    if (!await autoSendRoundLock.WaitAsync(0))
+    {
+        return;
+    }
+
+    try
+    {
+        if (!ligado || !IsAutoSendEnabled() || aCarregar || modoManutencao)
+        {
+            return;
+        }
+
+        ClearNextAutoSend();
+        autoSendCycleCount++;
+        Console.WriteLine($"[AUTO] Início da ronda {autoSendCycleCount} ({source}).");
+
+        foreach (string dataType in configuredDataTypes)
+        {
+            if (!ligado || !IsAutoSendEnabled() || aCarregar || modoManutencao)
+            {
+                break;
+            }
+
+            string generatedValue = SensorDataGenerator.Generate(dataType);
+            Console.WriteLine($"[AUTO] {dataType}={generatedValue}");
+            await EnviarMedicaoAsync(dataType, generatedValue, origemAutomatica: true);
+        }
+
+        Console.WriteLine($"[AUTO] Fim da ronda {autoSendCycleCount}.");
+
+        if (ligado && IsAutoSendEnabled() && !aCarregar && !modoManutencao)
+        {
+            ScheduleNextAutoSend(immediate: false);
+        }
+    }
+    finally
+    {
+        autoSendRoundLock.Release();
+    }
+}
+
+void RememberAutoSendPreference()
+{
+    if (IsAutoSendEnabled() || resumeAutoSendAfterCharging)
+    {
+        resumeAutoSendAfterCharging = true;
+    }
+}
+
+string GetDisplayedState()
+{
+    if (!ligado)
+    {
+        return "inativo";
+    }
+
+    if (modoManutencao)
+    {
+        return "manutencao";
+    }
+
+    return "ativo";
+}
+
+bool ShouldRunAutoSendNow()
+{
+    lock (autoSendLock)
+    {
+        return autoSendEnabled && nextAutoSendUtc != DateTime.MaxValue && DateTime.UtcNow >= nextAutoSendUtc;
+    }
+}
+
+void ScheduleNextAutoSend(bool immediate)
+{
+    lock (autoSendLock)
+    {
+        nextAutoSendUtc = immediate
+            ? DateTime.UtcNow
+            : DateTime.UtcNow.AddSeconds(autoSendIntervalSeconds);
+    }
+}
+
+void ClearNextAutoSend()
+{
+    lock (autoSendLock)
+    {
+        nextAutoSendUtc = DateTime.MaxValue;
+    }
+}
+
+void LoadSensorState()
+{
+    string statePath = GetSensorStatePath();
+    Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+
+    if (!File.Exists(statePath))
+    {
+        batteryLevel = 100;
+        maintenanceReason = REASON_OK;
+        return;
+    }
+
+    Dictionary<string, string> values = File.ReadAllLines(statePath)
+        .Where(line => !string.IsNullOrWhiteSpace(line) && !line.TrimStart().StartsWith('#'))
+        .Select(line => line.Split('=', 2))
+        .Where(parts => parts.Length == 2)
+        .ToDictionary(parts => parts[0].Trim().ToLowerInvariant(), parts => parts[1].Trim());
+
+    if (int.TryParse(values.GetValueOrDefault("battery_level"), out int savedBattery))
+    {
+        batteryLevel = Math.Clamp(savedBattery, 0, 100);
+    }
+
+    if (int.TryParse(values.GetValueOrDefault("auto_send_interval_seconds"), out int savedInterval) && savedInterval >= 5)
+    {
+        autoSendIntervalSeconds = savedInterval;
+    }
+
+    if (bool.TryParse(values.GetValueOrDefault("auto_send_enabled"), out bool savedAutoSendEnabled))
+    {
+        restoreAutoSendOnStartup = savedAutoSendEnabled;
+    }
+
+    if (bool.TryParse(values.GetValueOrDefault("resume_auto_send_after_charging"), out bool savedResumeAutoSend))
+    {
+        resumeAutoSendAfterCharging = savedResumeAutoSend;
+    }
+
+    maintenanceReason = values.GetValueOrDefault("maintenance_reason",
+        batteryLevel <= LOW_BATTERY_THRESHOLD ? REASON_LOW_BATTERY : REASON_OK);
+    modoManutencao = batteryLevel <= LOW_BATTERY_THRESHOLD;
+}
+
+void SaveSensorState()
+{
+    string statePath = GetSensorStatePath();
+    Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+
+    File.WriteAllLines(statePath, new[]
+    {
+        $"sensor_id={sensorId}",
+        $"battery_level={GetBatteryLevel()}",
+        $"auto_send_enabled={IsAutoSendEnabled() || resumeAutoSendAfterCharging || restoreAutoSendOnStartup}",
+        $"auto_send_interval_seconds={GetAutoSendIntervalSeconds()}",
+        $"resume_auto_send_after_charging={resumeAutoSendAfterCharging}",
+        $"maintenance_reason={maintenanceReason}",
+        $"updated_at={DateTime.Now:yyyy-MM-ddTHH:mm:ss}"
+    });
+}
+
+string GetSensorStatePath()
+{
+    return Path.Combine(Environment.CurrentDirectory, STATE_FOLDER, $"{sensorId}.state.txt");
 }
 
 async Task SendNotificationAsync(string notificationType, string payload)
