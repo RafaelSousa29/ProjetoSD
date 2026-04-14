@@ -32,6 +32,7 @@ ConcurrentDictionary<string, DateTime> lastSeenUtc = new(StringComparer.OrdinalI
 ConcurrentDictionary<string, int> heartbeatCounters = new(StringComparer.OrdinalIgnoreCase);
 ConcurrentDictionary<string, string> sensorStatusReasons = new(StringComparer.OrdinalIgnoreCase);
 ConcurrentDictionary<string, SensorSession> activeSessions = new(StringComparer.OrdinalIgnoreCase);
+ConcurrentDictionary<string, string> manualStateOverrides = new(StringComparer.OrdinalIgnoreCase);
 
 EnsureCsvExists();
 LoadPendingBuffer();
@@ -134,7 +135,8 @@ async Task HandleSensorAsync(TcpClient client)
                         currentTipos = new HashSet<string>(tiposSolicitados, StringComparer.OrdinalIgnoreCase);
                         isConnected = true;
                         MarkSensorAsSeen(id, validatedInfo.Estado == STATE_MAINTENANCE ? "Manutenção em curso." : "Ligação aceite.");
-                        UpdateSensorEntry(id, validatedInfo.Estado, DateTime.UtcNow);
+                        string connectedState = GetConnectedState(validatedInfo.Estado);
+                        UpdateSensorEntry(id, connectedState, DateTime.UtcNow);
 
                         string response = validatedInfo.Estado == STATE_MAINTENANCE
                             ? "CONN_ACK|MANUTENCAO"
@@ -186,7 +188,7 @@ async Task HandleSensorAsync(TcpClient client)
                         LogDataLocally(normalizedData);
                         QueueData(normalizedData);
                         RegisterSensorSeen(currentSensorId);
-                        UpdateSensorEntry(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
+                        ApplyAutomaticStateUpdate(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
 
                         Console.WriteLine($"[RECEBIDO] Sensor {currentSensorId} enviou {tipoDado}: {valor}");
                         await writer.WriteLineAsync("DATA_ACK|SUCESSO");
@@ -200,7 +202,7 @@ async Task HandleSensorAsync(TcpClient client)
                         }
 
                         MarkSensorAsSeen(currentSensorId, "Heartbeat recebido.");
-                        UpdateSensorEntry(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
+                        ApplyAutomaticStateUpdate(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
                         int heartbeatCount = heartbeatCounters.AddOrUpdate(currentSensorId, 1, (_, current) => current + 1);
                         if (heartbeatCount % 10 == 0)
                         {
@@ -231,7 +233,7 @@ async Task HandleSensorAsync(TcpClient client)
                         {
                             Console.WriteLine($"[ALERTA] Bateria baixa no sensor {currentSensorId}: {notificationPayload}");
                             sensorStatusReasons[currentSensorId] = $"Bateria baixa ({notificationPayload}).";
-                            UpdateSensorEntry(currentSensorId, STATE_MAINTENANCE, DateTime.UtcNow);
+                            ApplyAutomaticStateUpdate(currentSensorId, STATE_MAINTENANCE, DateTime.UtcNow);
                             await writer.WriteLineAsync("ACK_NOTIFY|SUCESSO|MANUTENCAO");
                         }
                         else if (notificationType == "CHARGING" &&
@@ -239,7 +241,7 @@ async Task HandleSensorAsync(TcpClient client)
                         {
                             Console.WriteLine($"[CARREGAMENTO] Sensor {currentSensorId} entrou em carregamento.");
                             sensorStatusReasons[currentSensorId] = "Sensor em carregamento.";
-                            UpdateSensorEntry(currentSensorId, STATE_MAINTENANCE, DateTime.UtcNow);
+                            ApplyAutomaticStateUpdate(currentSensorId, STATE_MAINTENANCE, DateTime.UtcNow);
                             await writer.WriteLineAsync("ACK_NOTIFY|SUCESSO|A_CARREGAR");
                         }
                         else if (notificationType == "CHARGING" &&
@@ -247,7 +249,7 @@ async Task HandleSensorAsync(TcpClient client)
                         {
                             Console.WriteLine($"[CARREGAMENTO] Sensor {currentSensorId} terminou o carregamento.");
                             sensorStatusReasons[currentSensorId] = "Carregamento concluído.";
-                            UpdateSensorEntry(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
+                            ApplyAutomaticStateUpdate(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
                             await writer.WriteLineAsync("ACK_NOTIFY|SUCESSO|ATIVO");
                         }
                         else
@@ -637,6 +639,61 @@ void MarkSensorAsSeen(string sensorId, string reason)
     sensorStatusReasons[sensorId] = reason;
 }
 
+string GetConnectedState(string currentState)
+{
+    return currentState == STATE_MAINTENANCE
+        ? STATE_MAINTENANCE
+        : STATE_ACTIVE;
+}
+
+void ApplyAutomaticStateUpdate(string sensorId, string automaticState, DateTime timestampUtc)
+{
+    if (TryGetLockedManualState(sensorId, out string? manualState))
+    {
+        UpdateSensorEntry(sensorId, manualState!, timestampUtc);
+        return;
+    }
+
+    UpdateSensorEntry(sensorId, automaticState, timestampUtc);
+}
+
+bool TryGetLockedManualState(string sensorId, out string? manualState)
+{
+    if (manualStateOverrides.TryGetValue(sensorId, out string? overrideState) &&
+        (overrideState == STATE_MAINTENANCE || overrideState == STATE_DISABLED))
+    {
+        manualState = overrideState;
+        return true;
+    }
+
+    manualState = null;
+    return false;
+}
+
+bool CanManuallySetActive(string sensorId, out string? reason)
+{
+    if (!sensorStatusReasons.TryGetValue(sensorId, out string? statusReason))
+    {
+        reason = null;
+        return true;
+    }
+
+    if (statusReason.Contains("Bateria baixa", StringComparison.OrdinalIgnoreCase))
+    {
+        reason = "o sensor continua sinalizado com bateria baixa";
+        return false;
+    }
+
+    if (statusReason.Contains("carregamento", StringComparison.OrdinalIgnoreCase))
+    {
+        reason = "o sensor continua em carregamento";
+        return false;
+    }
+
+    reason = null;
+    return true;
+}
+
 void UpdateSensorEntry(string id, string estado, DateTime timestampUtc)
 {
     lock (csvLock)
@@ -906,8 +963,23 @@ void ChangeSensorStateInteractive()
         return;
     }
 
+    if (newState == STATE_ACTIVE && !CanManuallySetActive(sensorId, out string? activeBlockReason))
+    {
+        Console.WriteLine($"[STATE] Não é possível colocar {sensorId} em ativo porque {activeBlockReason}.");
+        return;
+    }
+
     UpdateSensorEntry(sensorId, newState, DateTime.UtcNow);
     sensorStatusReasons[sensorId] = $"Estado alterado manualmente para {newState}.";
+
+    if (newState == STATE_MAINTENANCE || newState == STATE_DISABLED)
+    {
+        manualStateOverrides[sensorId] = newState;
+    }
+    else
+    {
+        manualStateOverrides.TryRemove(sensorId, out _);
+    }
 
     if (newState == STATE_INACTIVE || newState == STATE_DISABLED)
     {
