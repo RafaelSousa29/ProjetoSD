@@ -9,6 +9,7 @@ const int GATEWAY_PORT = 5000;
 const int HEARTBEAT_INTERVAL_MS = 10000;
 const int BATTERY_DRAIN_INTERVAL_MS = 45000;
 const int BATTERY_CHARGE_INTERVAL_MS = 5000;
+const int DEFAULT_VIDEO_FRAME_COUNT = 10;
 const int LOW_BATTERY_THRESHOLD = 20;
 const int VIDEO_STREAM_BATTERY_COST = 5;
 const int VIDEO_STREAM_FRAME_DELAY_MS = 500;
@@ -148,7 +149,8 @@ while (true)
     Console.WriteLine("3 - Ver bateria");
     Console.WriteLine("4 - Ativar/desativar envio automático");
     Console.WriteLine("5 - Alterar intervalo do envio automático");
-    Console.WriteLine("6 - Desligar");
+    Console.WriteLine("6 - Enviar vídeo simulado");
+    Console.WriteLine("7 - Desligar");
     Console.Write("Opção: ");
 
     string? opcao = Console.ReadLine();
@@ -178,6 +180,10 @@ while (true)
                 break;
 
             case "6":
+                await IniciarEnvioVideoAsync();
+                break;
+
+            case "7":
                 await DesligarSensor();
                 return;
 
@@ -259,6 +265,64 @@ async Task EnviarMedicaoAsync(string tipo, string valor, bool origemAutomatica)
     if (shouldCheckLowBattery)
     {
         await CheckLowBatteryAsync();
+    }
+}
+
+async Task IniciarEnvioVideoAsync()
+{
+    if (!CanUseConnection())
+    {
+        Console.WriteLine("[VIDEO] O sensor não está ligado ao gateway.");
+        return;
+    }
+
+    if (aCarregar || modoManutencao)
+    {
+        Console.WriteLine("[VIDEO] O sensor não pode iniciar vídeo no estado atual.");
+        return;
+    }
+
+    if (GetBatteryLevel() <= LOW_BATTERY_THRESHOLD)
+    {
+        Console.WriteLine("[VIDEO] Bateria insuficiente para iniciar vídeo.");
+        return;
+    }
+
+    Console.Write($"Número de frames simulados (Enter para {DEFAULT_VIDEO_FRAME_COUNT}): ");
+    string? input = Console.ReadLine()?.Trim();
+    int frameCount = DEFAULT_VIDEO_FRAME_COUNT;
+    if (!string.IsNullOrWhiteSpace(input) && (!int.TryParse(input, out frameCount) || frameCount <= 0))
+    {
+        Console.WriteLine("[VIDEO] Número de frames inválido.");
+        return;
+    }
+
+    await socketLock.WaitAsync();
+    try
+    {
+        string request = $"VIDEO_REQ|{sensorId}|{frameCount}";
+        await writer!.WriteLineAsync(request);
+        string? response = await WaitForProtocolResponseAsync();
+
+        if (response == null || !response.StartsWith("VIDEO_ACK|ACEITE|", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine($"[VIDEO] Pedido recusado pelo gateway: {response ?? "<sem resposta>"}");
+            return;
+        }
+
+        string[] parts = response.Split('|');
+        if (parts.Length < 3 || !int.TryParse(parts[2], out int streamPort))
+        {
+            Console.WriteLine($"[VIDEO] Resposta inválida do gateway: {response}");
+            return;
+        }
+
+        Console.WriteLine($"[VIDEO] Pedido aceite. A iniciar stream para a porta {streamPort}...");
+        _ = Task.Run(() => StreamVideoAsync(streamPort, frameCount));
+    }
+    finally
+    {
+        socketLock.Release();
     }
 }
 
@@ -910,12 +974,13 @@ void SaveSensorState()
 {
     string statePath = GetSensorStatePath();
     Directory.CreateDirectory(Path.GetDirectoryName(statePath)!);
+    bool shouldRestoreAutoSend = IsAutoSendEnabled() || resumeAutoSendAfterCharging;
 
     File.WriteAllLines(statePath, new[]
     {
         $"sensor_id={sensorId}",
         $"battery_level={GetBatteryLevel()}",
-        $"auto_send_enabled={IsAutoSendEnabled() || resumeAutoSendAfterCharging || restoreAutoSendOnStartup}",
+        $"auto_send_enabled={shouldRestoreAutoSend}",
         $"auto_send_interval_seconds={GetAutoSendIntervalSeconds()}",
         $"resume_auto_send_after_charging={resumeAutoSendAfterCharging}",
         $"maintenance_reason={maintenanceReason}",

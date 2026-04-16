@@ -41,7 +41,7 @@ TcpListener listener = new(IPAddress.Any, GATEWAY_PORT);
 listener.Start();
 
 Console.WriteLine($"[GATEWAY {GATEWAY_ID}] Ativo na porta {GATEWAY_PORT}...");
-Console.WriteLine("Comandos disponíveis: 'send', 'status', 'create', 'state' e 'video'.");
+Console.WriteLine("Comandos disponíveis: 'send', 'status', 'create' e 'state'.");
 
 _ = Task.Run(BatchTimerLoop);
 _ = Task.Run(ManualCommandLoop);
@@ -271,6 +271,22 @@ async Task HandleSensorAsync(TcpClient client)
                                 : "ERRO|SEM_PAYLOAD";
                             videoSession.TryCompleteVideoAck(payload);
                         }
+                        break;
+
+                    case "VIDEO_REQ":
+                        if (!isConnected || currentSensorId == null)
+                        {
+                            await writer.WriteLineAsync("VIDEO_ACK|ERRO|NAO_LIGADO");
+                            break;
+                        }
+
+                        if (parts.Length < 3 || !int.TryParse(parts[2].Trim(), out int requestedFrameCount) || requestedFrameCount <= 0)
+                        {
+                            await writer.WriteLineAsync("VIDEO_ACK|ERRO|FORMATO_INVALIDO");
+                            break;
+                        }
+
+                        await HandleSensorVideoStartRequestAsync(currentSensorId, requestedFrameCount, writer);
                         break;
 
                     case "DISCONNECT":
@@ -521,6 +537,46 @@ async Task RequestVideoInteractiveAsync()
     }
 }
 
+async Task HandleSensorVideoStartRequestAsync(string sensorId, int frameCount, StreamWriter writer)
+{
+    SensorInfo? sensor = FindSensor(sensorId);
+    if (sensor == null)
+    {
+        await writer.WriteLineAsync("VIDEO_ACK|ERRO|SENSOR_DESCONHECIDO");
+        return;
+    }
+
+    if (sensor.Estado != STATE_ACTIVE)
+    {
+        await writer.WriteLineAsync("VIDEO_ACK|ERRO|SENSOR_NAO_ATIVO");
+        return;
+    }
+
+    Directory.CreateDirectory(Path.Combine(Environment.CurrentDirectory, VIDEO_STREAMS_FOLDER));
+
+    using TcpListener videoListener = new(IPAddress.Any, 0);
+    videoListener.Start();
+
+    int videoPort = ((IPEndPoint)videoListener.LocalEndpoint).Port;
+    await writer.WriteLineAsync($"VIDEO_ACK|ACEITE|{videoPort}");
+
+    try
+    {
+        Console.WriteLine($"[VIDEO] Sensor {sensorId} iniciou pedido de vídeo ({frameCount} frames).");
+        using TcpClient videoClient = await videoListener.AcceptTcpClientAsync().WaitAsync(TimeSpan.FromSeconds(15));
+        string savedPath = await ReceiveVideoStreamAsync(sensorId, videoClient);
+        Console.WriteLine($"[VIDEO] Stream do sensor {sensorId} guardada em {savedPath}");
+    }
+    catch (TimeoutException)
+    {
+        Console.WriteLine($"[VIDEO] Timeout à espera da stream iniciada pelo sensor {sensorId}.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[VIDEO] Erro ao receber stream do sensor {sensorId}: {ex.Message}");
+    }
+}
+
 async Task<string> ReceiveVideoStreamAsync(string sensorId, TcpClient videoClient)
 {
     using NetworkStream stream = videoClient.GetStream();
@@ -556,7 +612,46 @@ async Task<string> ReceiveVideoStreamAsync(string sensorId, TcpClient videoClien
 
     File.WriteAllLines(filePath, lines);
     LogDataLocally($"VIDEO|{sensorId}|{timestamp}|{frameCounter}_frames|{Path.GetFileName(filePath)}");
+    await ForwardVideoBatchToServerAsync(sensorId, lines);
     return filePath;
+}
+
+async Task ForwardVideoBatchToServerAsync(string sensorId, List<string> videoLines)
+{
+    if (videoLines.Count == 0)
+    {
+        return;
+    }
+
+    try
+    {
+        using TcpClient server = new();
+        await server.ConnectAsync(SERVER_IP, SERVER_PORT);
+
+        using NetworkStream stream = server.GetStream();
+        using StreamWriter sw = new(stream, Encoding.UTF8) { AutoFlush = true };
+        using StreamReader sr = new(stream, Encoding.UTF8);
+
+        await sw.WriteLineAsync($"VIDEO_BATCH|{GATEWAY_ID}|{sensorId}|{videoLines.Count}");
+        foreach (string line in videoLines)
+        {
+            await sw.WriteLineAsync(line);
+        }
+        await sw.WriteLineAsync("END");
+
+        string? ack = await sr.ReadLineAsync();
+        if (ack != "VIDEO_BATCH_ACK|SUCESSO")
+        {
+            Console.WriteLine($"[VIDEO] ACK inesperado do servidor: {ack ?? "<null>"}");
+            return;
+        }
+
+        Console.WriteLine($"[VIDEO] Stream do sensor {sensorId} enviada ao servidor com sucesso.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[VIDEO] Falha ao enviar stream do sensor {sensorId} ao servidor: {ex.Message}");
+    }
 }
 
 async Task MonitorSensorsLoop()

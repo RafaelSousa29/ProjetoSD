@@ -44,83 +44,19 @@ async Task HandleGatewayAsync(TcpClient client)
 
                 Console.WriteLine($"[SERVIDOR] Recebido: {line}");
 
-                if (!line.StartsWith("DATA_BATCH|", StringComparison.OrdinalIgnoreCase))
+                if (line.StartsWith("DATA_BATCH|", StringComparison.OrdinalIgnoreCase))
                 {
-                    await writer.WriteLineAsync("SERVER_ACK|ERRO|COMANDO_DESCONHECIDO");
+                    await HandleDataBatchAsync(line, reader, writer);
                     continue;
                 }
 
-                string[] mainParts = line.Split('|', 3);
-                if (mainParts.Length < 3 || !int.TryParse(mainParts[2], out int expectedCount) || expectedCount < 0)
+                if (line.StartsWith("VIDEO_BATCH|", StringComparison.OrdinalIgnoreCase))
                 {
-                    await writer.WriteLineAsync("BATCH_ACK|ERRO|FORMATO_INVALIDO");
+                    await HandleVideoBatchAsync(line, reader, writer);
                     continue;
                 }
 
-                string gatewayId = mainParts[1].Trim();
-                List<string> medicoes = new(expectedCount);
-                bool terminatorReceived = false;
-
-                while (true)
-                {
-                    string? measurementLine = await reader.ReadLineAsync();
-                    if (measurementLine == null)
-                    {
-                        break;
-                    }
-
-                    if (measurementLine.Equals("END", StringComparison.OrdinalIgnoreCase))
-                    {
-                        terminatorReceived = true;
-                        break;
-                    }
-
-                    medicoes.Add(measurementLine);
-                }
-
-                if (!terminatorReceived || medicoes.Count != expectedCount)
-                {
-                    await writer.WriteLineAsync("BATCH_ACK|ERRO|CONTAGEM_INVALIDA");
-                    continue;
-                }
-
-                bool success = true;
-                Dictionary<string, int> updatedTypes = new(StringComparer.OrdinalIgnoreCase);
-
-                Console.WriteLine($"[SERVIDOR] Lote recebido de {gatewayId}: {expectedCount} medições.");
-
-                foreach (string medicao in medicoes)
-                {
-                    string[] p = medicao.Split('|');
-                    if (p.Length < 5 || !p[0].Equals("DATA", StringComparison.OrdinalIgnoreCase))
-                    {
-                        success = false;
-                        break;
-                    }
-
-                    try
-                    {
-                        await GravarDadosAsync(gatewayId, p[1], p[2], p[3], p[4]);
-                        string normalizedType = p[3].Trim().ToUpperInvariant();
-                        updatedTypes[normalizedType] = updatedTypes.GetValueOrDefault(normalizedType) + 1;
-                    }
-                    catch (Exception ex)
-                    {
-                        success = false;
-                        Console.WriteLine($"[SERVIDOR] Erro ao gravar medição: {ex.Message}");
-                        break;
-                    }
-                }
-
-                if (success)
-                {
-                    foreach (KeyValuePair<string, int> entry in updatedTypes)
-                    {
-                        Console.WriteLine($"[SERVIDOR] {entry.Key}.txt atualizado ({entry.Value} registos).");
-                    }
-                }
-
-                await writer.WriteLineAsync(success ? "BATCH_ACK|SUCESSO" : "BATCH_ACK|ERRO|PROCESSAMENTO");
+                await writer.WriteLineAsync("SERVER_ACK|ERRO|COMANDO_DESCONHECIDO");
             }
         }
         catch (Exception ex)
@@ -130,6 +66,118 @@ async Task HandleGatewayAsync(TcpClient client)
     }
 
     Console.WriteLine("[SERVIDOR] Gateway desligado.");
+}
+
+async Task HandleDataBatchAsync(string header, StreamReader reader, StreamWriter writer)
+{
+    string[] mainParts = header.Split('|', 3);
+    if (mainParts.Length < 3 || !int.TryParse(mainParts[2], out int expectedCount) || expectedCount < 0)
+    {
+        await writer.WriteLineAsync("BATCH_ACK|ERRO|FORMATO_INVALIDO");
+        return;
+    }
+
+    string gatewayId = mainParts[1].Trim();
+    (List<string> medicoes, bool terminatorReceived) = await ReadBatchLinesAsync(reader, expectedCount);
+    if (!terminatorReceived || medicoes.Count != expectedCount)
+    {
+        await writer.WriteLineAsync("BATCH_ACK|ERRO|CONTAGEM_INVALIDA");
+        return;
+    }
+
+    bool success = true;
+    Dictionary<string, int> updatedTypes = new(StringComparer.OrdinalIgnoreCase);
+
+    Console.WriteLine($"[SERVIDOR] Lote recebido de {gatewayId}: {expectedCount} medições.");
+
+    foreach (string medicao in medicoes)
+    {
+        string[] p = medicao.Split('|');
+        if (p.Length < 5 || !p[0].Equals("DATA", StringComparison.OrdinalIgnoreCase))
+        {
+            success = false;
+            break;
+        }
+
+        try
+        {
+            await GravarDadosAsync(gatewayId, p[1], p[2], p[3], p[4]);
+            string normalizedType = p[3].Trim().ToUpperInvariant();
+            updatedTypes[normalizedType] = updatedTypes.GetValueOrDefault(normalizedType) + 1;
+        }
+        catch (Exception ex)
+        {
+            success = false;
+            Console.WriteLine($"[SERVIDOR] Erro ao gravar medição: {ex.Message}");
+            break;
+        }
+    }
+
+    if (success)
+    {
+        foreach (KeyValuePair<string, int> entry in updatedTypes)
+        {
+            Console.WriteLine($"[SERVIDOR] {entry.Key}.txt atualizado ({entry.Value} registos).");
+        }
+    }
+
+    await writer.WriteLineAsync(success ? "BATCH_ACK|SUCESSO" : "BATCH_ACK|ERRO|PROCESSAMENTO");
+}
+
+async Task HandleVideoBatchAsync(string header, StreamReader reader, StreamWriter writer)
+{
+    string[] mainParts = header.Split('|', 4);
+    if (mainParts.Length < 4 || !int.TryParse(mainParts[3], out int expectedCount) || expectedCount < 0)
+    {
+        await writer.WriteLineAsync("VIDEO_BATCH_ACK|ERRO|FORMATO_INVALIDO");
+        return;
+    }
+
+    string gatewayId = mainParts[1].Trim();
+    string sensorId = mainParts[2].Trim();
+    (List<string> videoLines, bool terminatorReceived) = await ReadBatchLinesAsync(reader, expectedCount);
+    if (!terminatorReceived || videoLines.Count != expectedCount)
+    {
+        await writer.WriteLineAsync("VIDEO_BATCH_ACK|ERRO|CONTAGEM_INVALIDA");
+        return;
+    }
+
+    try
+    {
+        await GravarVideoAsync(gatewayId, sensorId, videoLines);
+        Console.WriteLine($"[SERVIDOR] Vídeo recebido de {gatewayId}/{sensorId}: {videoLines.Count} linhas.");
+        await writer.WriteLineAsync("VIDEO_BATCH_ACK|SUCESSO");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[SERVIDOR] Erro ao gravar vídeo: {ex.Message}");
+        await writer.WriteLineAsync("VIDEO_BATCH_ACK|ERRO|PROCESSAMENTO");
+    }
+}
+
+async Task<(List<string> Lines, bool TerminatorReceived)> ReadBatchLinesAsync(StreamReader reader, int expectedCount)
+{
+    List<string> lines = new(expectedCount);
+    bool terminatorReceived = false;
+
+    while (true)
+    {
+        string? line = await reader.ReadLineAsync();
+        if (line == null)
+        {
+            break;
+        }
+
+        if (line.Equals("END", StringComparison.OrdinalIgnoreCase))
+        {
+            terminatorReceived = true;
+            break;
+        }
+
+        lines.Add(line);
+    }
+
+    return (lines, terminatorReceived);
 }
 
 async Task GravarDadosAsync(string gatewayId, string sensorId, string timestamp, string tipoDado, string valor)
@@ -172,6 +220,27 @@ async Task GravarDadosAsync(string gatewayId, string sensorId, string timestamp,
     {
         databaseLock.Release();
     }
+}
+
+async Task GravarVideoAsync(string gatewayId, string sensorId, List<string> videoLines)
+{
+    string fileName = $"VIDEO_{sensorId}.txt";
+    Mutex fileMutex = fileMutexes.GetOrAdd(fileName, _ => new Mutex());
+
+    fileMutex.WaitOne();
+    try
+    {
+        List<string> logLines = new();
+        logLines.Add($"--- VIDEO BATCH | Gateway: {gatewayId} | Sensor: {sensorId} | Recebido: {DateTime.Now:yyyy-MM-ddTHH:mm:ss} ---");
+        logLines.AddRange(videoLines);
+        File.AppendAllLines(fileName, logLines);
+    }
+    finally
+    {
+        fileMutex.ReleaseMutex();
+    }
+
+    await Task.CompletedTask;
 }
 
 void InitializeDatabase()
