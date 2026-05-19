@@ -1,11 +1,15 @@
 using DataGenerator;
+using RabbitMQ.Client;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 
-const string GATEWAY_IP = "127.0.0.1";
-const int GATEWAY_PORT = 5000;
+const string DEFAULT_GATEWAY_IP = "127.0.0.1";
+const int DEFAULT_GATEWAY_PORT = 5000;
+const string RABBITMQ_HOST = "localhost";
+const string RABBITMQ_EXCHANGE = "onehealth.medicoes";
 const int HEARTBEAT_INTERVAL_MS = 10000;
 const int BATTERY_DRAIN_INTERVAL_MS = 45000;
 const int BATTERY_CHARGE_INTERVAL_MS = 5000;
@@ -24,6 +28,7 @@ const string REASON_LOW_BATTERY = "Bateria fraca";
 const string REASON_CHARGING = "A carregar";
 
 SensorConfig config = ReadStartupConfig();
+List<GatewayEndpoint> gatewayEndpoints = ReadGatewayEndpoints();
 string sensorId = config.SensorId;
 string zona = config.Zona;
 string tiposDados = config.TiposDados;
@@ -32,9 +37,7 @@ List<string> configuredDataTypes = tiposDados
     .Select(type => type.ToUpperInvariant())
     .ToList();
 
-TcpClient? client = null;
-StreamReader? reader = null;
-StreamWriter? writer = null;
+List<GatewaySession> gatewaySessions = new();
 
 bool ligado = false;
 bool modoManutencao = false;
@@ -50,7 +53,6 @@ int autoSendIntervalSeconds = 60;
 int autoSendCycleCount = 0;
 Task? chargingTask = null;
 Task? heartbeatTask = null;
-Task? receiveLoopTask = null;
 DateTime nextAutoSendUtc = DateTime.MaxValue;
 string maintenanceReason = REASON_OK;
 
@@ -58,36 +60,58 @@ Lock batteryLock = new();
 Lock autoSendLock = new();
 Lock heartbeatTaskLock = new();
 Lock videoStateLock = new();
-SemaphoreSlim socketLock = new(1, 1);
 SemaphoreSlim autoSendRoundLock = new(1, 1);
-SemaphoreSlim responseSignal = new(0);
-ConcurrentQueue<string> responseQueue = new();
 bool videoStreamActive = false;
 
 LoadSensorState();
 
 try
 {
-    client = new TcpClient();
-    await client.ConnectAsync(GATEWAY_IP, GATEWAY_PORT);
-
-    NetworkStream stream = client.GetStream();
-    reader = new StreamReader(stream, Encoding.UTF8);
-    writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-    receiveLoopTask = Task.Run(ReceiveLoopAsync);
-
     string connectMsg = $"CONNECT|{sensorId}|{tiposDados}|{zona}";
-    await writer.WriteLineAsync(connectMsg);
+    List<string> acceptedResponses = new();
 
-    string? response = await WaitForProtocolResponseAsync();
-    Console.WriteLine($"[SENSOR] Resposta: {response}");
+    foreach (GatewayEndpoint endpoint in gatewayEndpoints)
+    {
+        GatewaySession session = new(endpoint);
 
-    if (response == "CONN_ACK|ACEITE")
+        try
+        {
+            string? response = await session.ConnectAsync(connectMsg, HandleVideoRequestAsync);
+            Console.WriteLine($"[SENSOR] Resposta de {endpoint}: {response}");
+
+            if (response == "CONN_ACK|ACEITE" || response == "CONN_ACK|MANUTENCAO")
+            {
+                gatewaySessions.Add(session);
+                acceptedResponses.Add(response);
+            }
+            else
+            {
+                await session.CloseAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            await session.CloseAsync();
+            Console.WriteLine($"[SENSOR] Erro ao ligar ao gateway {endpoint}: {ex.Message}");
+        }
+    }
+
+    if (gatewaySessions.Count == 0)
+    {
+        Console.WriteLine("[SENSOR] Nenhum gateway aceitou a ligação. O programa vai terminar.");
+        await FecharLigacaoLocal();
+        return;
+    }
+
+    bool hasNormalConnection = acceptedResponses.Any(response =>
+        response.Equals("CONN_ACK|ACEITE", StringComparison.OrdinalIgnoreCase));
+
+    if (hasNormalConnection)
     {
         ligado = true;
         modoManutencao = batteryLevel <= LOW_BATTERY_THRESHOLD;
         heartbeatAtivo = !modoManutencao;
-        Console.WriteLine("[SENSOR] Ligação aceite em modo normal.");
+        Console.WriteLine($"[SENSOR] Ligação aceite em {gatewaySessions.Count} gateway(s).");
         if (modoManutencao)
         {
             maintenanceReason = REASON_LOW_BATTERY;
@@ -107,7 +131,7 @@ try
             }
         }
     }
-    else if (response == "CONN_ACK|MANUTENCAO")
+    else
     {
         ligado = true;
         modoManutencao = true;
@@ -116,13 +140,7 @@ try
         {
             maintenanceReason = REASON_LOW_BATTERY;
         }
-        Console.WriteLine("[SENSOR] Ligação aceite em modo manutenção.");
-    }
-    else
-    {
-        Console.WriteLine("[SENSOR] Ligação recusada. O programa vai terminar.");
-        await FecharLigacaoLocal();
-        return;
+        Console.WriteLine($"[SENSOR] Ligação aceite em modo manutenção por {gatewaySessions.Count} gateway(s).");
     }
 
     _ = Task.Run(BatteryDrainLoop);
@@ -205,10 +223,16 @@ async Task EnviarMedicaoManual()
     Console.Write("Tipo de dado: ");
     string tipo = (Console.ReadLine()?.Trim() ?? "TEMP").ToUpperInvariant();
 
-    Console.Write("Valor: ");
-    string valor = Console.ReadLine()?.Trim() ?? "0";
+    Console.Write($"Valor (ex: 25, {tipo}=25, {tipo}-25, {tipo}.25, {tipo}/25): ");
+    string valorInput = Console.ReadLine()?.Trim() ?? "0";
 
-    await EnviarMedicaoAsync(tipo, valor, origemAutomatica: false);
+    if (string.IsNullOrWhiteSpace(valorInput))
+    {
+        Console.WriteLine("[SENSOR] Valor inválido: introduz um valor, por exemplo 25 ou TEMP=25.");
+        return;
+    }
+
+    await EnviarMedicaoAsync(tipo, valorInput, origemAutomatica: false);
 }
 
 async Task EnviarMedicaoAsync(string tipo, string valor, bool origemAutomatica)
@@ -241,31 +265,66 @@ async Task EnviarMedicaoAsync(string tipo, string valor, bool origemAutomatica)
 
     bool shouldCheckLowBattery = false;
 
-    await socketLock.WaitAsync();
-    try
-    {
-        string dataMsg = $"DATA|{sensorId}|{timestamp}|{tipo}|{valor}";
-        await writer.WriteLineAsync(dataMsg);
+    string dataMsg = $"DATA|{sensorId}|{timestamp}|{tipo}|{valor}";
+    string topic = BuildDataTopic(tipo);
+    string? response = await PublishMeasurementAsync(topic, dataMsg);
+    Console.WriteLine($"[SENSOR] Resposta Pub/Sub: {response}");
 
-        string? response = await WaitForProtocolResponseAsync();
-        Console.WriteLine($"[SENSOR] Resposta: {response}");
-
-        if (response == "DATA_ACK|SUCESSO")
-        {
-            ConsumeBattery(DATA_BATTERY_COST);
-            shouldCheckLowBattery = true;
-            SaveSensorState();
-        }
-    }
-    finally
+    if (response != null && response.StartsWith("PUB_ACK|SUCESSO", StringComparison.OrdinalIgnoreCase))
     {
-        socketLock.Release();
+        ConsumeBattery(DATA_BATTERY_COST);
+        shouldCheckLowBattery = true;
+        SaveSensorState();
     }
 
     if (shouldCheckLowBattery)
     {
         await CheckLowBatteryAsync();
     }
+}
+
+async Task<string?> PublishMeasurementAsync(string topic, string payload)
+{
+    try
+    {
+        await Task.Run(() =>
+        {
+            ConnectionFactory factory = new() { HostName = RABBITMQ_HOST };
+            using IConnection connection = factory.CreateConnection();
+            using IModel channel = connection.CreateModel();
+
+            channel.ExchangeDeclare(
+                exchange: RABBITMQ_EXCHANGE,
+                type: ExchangeType.Topic,
+                durable: true,
+                autoDelete: false);
+
+            IBasicProperties properties = channel.CreateBasicProperties();
+            properties.Persistent = true;
+            properties.ContentType = "text/plain";
+            properties.Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+            byte[] body = Encoding.UTF8.GetBytes(payload);
+            channel.ConfirmSelect();
+            channel.BasicPublish(
+                exchange: RABBITMQ_EXCHANGE,
+                routingKey: topic,
+                basicProperties: properties,
+                body: body);
+            channel.WaitForConfirmsOrDie(TimeSpan.FromSeconds(5));
+        }).WaitAsync(TimeSpan.FromSeconds(8));
+
+        return "PUB_ACK|SUCESSO|RABBITMQ";
+    }
+    catch (Exception ex)
+    {
+        return $"PUB_ACK|ERRO|RABBITMQ_INDISPONIVEL:{ex.Message}";
+    }
+}
+
+string BuildDataTopic(string tipo)
+{
+    return $"DATA.{sensorId.ToUpperInvariant()}.{zona.ToUpperInvariant()}.{tipo.ToUpperInvariant()}";
 }
 
 async Task IniciarEnvioVideoAsync()
@@ -297,33 +356,30 @@ async Task IniciarEnvioVideoAsync()
         return;
     }
 
-    await socketLock.WaitAsync();
-    try
+    GatewaySession? selectedGateway = SelectGatewaySession("enviar vídeo");
+    if (selectedGateway == null)
     {
-        string request = $"VIDEO_REQ|{sensorId}|{frameCount}";
-        await writer!.WriteLineAsync(request);
-        string? response = await WaitForProtocolResponseAsync();
-
-        if (response == null || !response.StartsWith("VIDEO_ACK|ACEITE|", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine($"[VIDEO] Pedido recusado pelo gateway: {response ?? "<sem resposta>"}");
-            return;
-        }
-
-        string[] parts = response.Split('|');
-        if (parts.Length < 3 || !int.TryParse(parts[2], out int streamPort))
-        {
-            Console.WriteLine($"[VIDEO] Resposta inválida do gateway: {response}");
-            return;
-        }
-
-        Console.WriteLine($"[VIDEO] Pedido aceite. A iniciar stream para a porta {streamPort}...");
-        _ = Task.Run(() => StreamVideoAsync(streamPort, frameCount));
+        return;
     }
-    finally
+
+    string request = $"VIDEO_REQ|{sensorId}|{frameCount}";
+    string? response = await selectedGateway.SendRequestAsync(request);
+
+    if (response == null || !response.StartsWith("VIDEO_ACK|ACEITE|", StringComparison.OrdinalIgnoreCase))
     {
-        socketLock.Release();
+        Console.WriteLine($"[VIDEO] Pedido recusado pelo gateway {selectedGateway.Endpoint}: {response ?? "<sem resposta>"}");
+        return;
     }
+
+    string[] parts = response.Split('|');
+    if (parts.Length < 3 || !int.TryParse(parts[2], out int streamPort))
+    {
+        Console.WriteLine($"[VIDEO] Resposta inválida do gateway: {response}");
+        return;
+    }
+
+    Console.WriteLine($"[VIDEO] Pedido aceite por {selectedGateway.Endpoint}. A iniciar stream para a porta {streamPort}...");
+    _ = Task.Run(() => StreamVideoAsync(selectedGateway.Endpoint.Host, streamPort, frameCount));
 }
 
 void ToggleAutoSend()
@@ -473,7 +529,7 @@ async Task HeartbeatLoop()
         {
             await Task.Delay(HEARTBEAT_INTERVAL_MS);
 
-            if (!heartbeatAtivo || !ligado || writer == null || reader == null || aCarregar)
+            if (!heartbeatAtivo || !ligado || !gatewaySessions.Any(session => session.IsConnected) || aCarregar)
             {
                 continue;
             }
@@ -487,35 +543,34 @@ async Task HeartbeatLoop()
 
             bool shouldCheckLowBattery = false;
 
-            await socketLock.WaitAsync();
-            try
+            string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+            string hbMsg = $"HEARTBEAT|{sensorId}|{timestamp}";
+            int successfulHeartbeats = 0;
+
+            foreach (GatewaySession session in gatewaySessions.Where(session => session.IsConnected).ToList())
             {
-                string timestamp = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
-                string hbMsg = $"HEARTBEAT|{sensorId}|{timestamp}";
-                await writer.WriteLineAsync(hbMsg);
-
-                string? response = await WaitForProtocolResponseAsync();
-                heartbeatCount++;
-
+                string? response = await session.SendRequestAsync(hbMsg, timeoutSeconds: 5);
                 if (response == null || !response.StartsWith("ACK_HEARTBEAT|SUCESSO", StringComparison.OrdinalIgnoreCase))
                 {
-                    Console.WriteLine($"[SENSOR] Erro no heartbeat: {response}");
+                    Console.WriteLine($"[SENSOR] Erro no heartbeat para {session.Endpoint}: {response}");
                 }
                 else
                 {
-                    ConsumeBattery(HEARTBEAT_BATTERY_COST);
-                    shouldCheckLowBattery = true;
-                    SaveSensorState();
-
-                    if (heartbeatCount % 10 == 0)
-                    {
-                        Console.WriteLine($"[SENSOR] {heartbeatCount} heartbeats enviados com sucesso.");
-                    }
+                    successfulHeartbeats++;
                 }
             }
-            finally
+
+            if (successfulHeartbeats > 0)
             {
-                socketLock.Release();
+                heartbeatCount++;
+                ConsumeBattery(HEARTBEAT_BATTERY_COST);
+                shouldCheckLowBattery = true;
+                SaveSensorState();
+
+                if (heartbeatCount % 10 == 0)
+                {
+                    Console.WriteLine($"[SENSOR] {heartbeatCount} rondas de heartbeat enviadas para {successfulHeartbeats} gateway(s).");
+                }
             }
 
             if (shouldCheckLowBattery)
@@ -537,62 +592,12 @@ async Task HeartbeatLoop()
     }
 }
 
-async Task ReceiveLoopAsync()
-{
-    try
-    {
-        while (reader != null)
-        {
-            string? line = await reader.ReadLineAsync();
-            if (line == null)
-            {
-                break;
-            }
-
-            if (line.StartsWith("VIDEO_REQ|", StringComparison.OrdinalIgnoreCase))
-            {
-                _ = Task.Run(() => HandleVideoRequestAsync(line));
-                continue;
-            }
-
-            responseQueue.Enqueue(line);
-            responseSignal.Release();
-        }
-    }
-    catch (ObjectDisposedException)
-    {
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[SENSOR] Erro na receção: {ex.Message}");
-    }
-    finally
-    {
-        ligado = false;
-        responseQueue.Enqueue("ERROR|LIGACAO_FECHADA");
-        responseSignal.Release();
-    }
-}
-
-async Task<string?> WaitForProtocolResponseAsync(int timeoutSeconds = 15)
-{
-    bool received = await responseSignal.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds));
-    if (!received)
-    {
-        return null;
-    }
-
-    return responseQueue.TryDequeue(out string? response)
-        ? response
-        : null;
-}
-
-async Task HandleVideoRequestAsync(string requestLine)
+async Task HandleVideoRequestAsync(GatewaySession session, string requestLine)
 {
     string[] parts = requestLine.Split('|');
     if (parts.Length < 4)
     {
-        await SendVideoAckAsync("RECUSADO|FORMATO_INVALIDO");
+        await SendVideoAckAsync(session, "RECUSADO|FORMATO_INVALIDO");
         return;
     }
 
@@ -606,7 +611,7 @@ async Task HandleVideoRequestAsync(string requestLine)
         streamPort <= 0 ||
         frameCount <= 0)
     {
-        await SendVideoAckAsync("RECUSADO|PEDIDO_INVALIDO");
+        await SendVideoAckAsync(session, "RECUSADO|PEDIDO_INVALIDO");
         return;
     }
 
@@ -614,7 +619,7 @@ async Task HandleVideoRequestAsync(string requestLine)
     {
         if (videoStreamActive)
         {
-            _ = SendVideoAckAsync("RECUSADO|STREAM_OCUPADA");
+            _ = SendVideoAckAsync(session, "RECUSADO|STREAM_OCUPADA");
             return;
         }
 
@@ -628,38 +633,30 @@ async Task HandleVideoRequestAsync(string requestLine)
             videoStreamActive = false;
         }
 
-        await SendVideoAckAsync("RECUSADO|SENSOR_INDISPONIVEL");
+        await SendVideoAckAsync(session, "RECUSADO|SENSOR_INDISPONIVEL");
         return;
     }
 
-    await SendVideoAckAsync($"ACEITE|{streamPort}");
-    _ = Task.Run(() => StreamVideoAsync(streamPort, frameCount));
+    await SendVideoAckAsync(session, $"ACEITE|{streamPort}");
+    _ = Task.Run(() => StreamVideoAsync(session.Endpoint.Host, streamPort, frameCount));
 }
 
-async Task SendVideoAckAsync(string payload)
+async Task SendVideoAckAsync(GatewaySession session, string payload)
 {
     if (!CanUseConnection())
     {
         return;
     }
 
-    await socketLock.WaitAsync();
-    try
-    {
-        await writer!.WriteLineAsync($"VIDEO_ACK|{sensorId}|{payload}");
-    }
-    finally
-    {
-        socketLock.Release();
-    }
+    await session.SendOneWayAsync($"VIDEO_ACK|{sensorId}|{payload}");
 }
 
-async Task StreamVideoAsync(int streamPort, int frameCount)
+async Task StreamVideoAsync(string gatewayHost, int streamPort, int frameCount)
 {
     try
     {
         using TcpClient streamClient = new();
-        await streamClient.ConnectAsync(GATEWAY_IP, streamPort);
+        await streamClient.ConnectAsync(gatewayHost, streamPort);
 
         using NetworkStream stream = streamClient.GetStream();
         using StreamWriter streamWriter = new(stream, Encoding.UTF8) { AutoFlush = true };
@@ -855,7 +852,7 @@ string GetDisplayedState()
 
 bool CanUseConnection()
 {
-    return ligado && writer != null && reader != null;
+    return ligado && gatewaySessions.Any(session => session.IsConnected);
 }
 
 bool CanSendMeasurement(bool origemAutomatica)
@@ -995,23 +992,16 @@ string GetSensorStatePath()
 
 async Task SendNotificationAsync(string notificationType, string payload)
 {
-    if (!ligado || writer == null || reader == null)
+    if (!ligado || gatewaySessions.Count == 0)
     {
         return;
     }
 
-    await socketLock.WaitAsync();
-    try
+    string notifyMsg = $"NOTIFY|{sensorId}|{notificationType}|{payload}";
+    foreach (GatewaySession session in gatewaySessions.Where(session => session.IsConnected).ToList())
     {
-        string notifyMsg = $"NOTIFY|{sensorId}|{notificationType}|{payload}";
-        await writer.WriteLineAsync(notifyMsg);
-
-        string? response = await WaitForProtocolResponseAsync();
-        Console.WriteLine($"[SENSOR] Resposta: {response}");
-    }
-    finally
-    {
-        socketLock.Release();
+        string? response = await session.SendRequestAsync(notifyMsg);
+        Console.WriteLine($"[SENSOR] Resposta de {session.Endpoint}: {response}");
     }
 }
 
@@ -1019,29 +1009,30 @@ async Task TrySendNotificationAsync(string notificationType, string payload)
 {
     try
     {
-        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(3));
-        bool acquired = await socketLock.WaitAsync(0, cts.Token);
-        if (!acquired)
+        if (!ligado || gatewaySessions.Count == 0)
         {
-            Console.WriteLine($"[SENSOR] Não foi possível notificar {notificationType} de imediato.");
             return;
         }
 
-        try
+        string notifyMsg = $"NOTIFY|{sensorId}|{notificationType}|{payload}";
+        int sentCount = 0;
+
+        foreach (GatewaySession session in gatewaySessions.Where(session => session.IsConnected).ToList())
         {
-            if (!ligado || writer == null || reader == null)
+            string? response = await session.TrySendRequestAsync(notifyMsg, timeoutSeconds: 3);
+            if (response == null)
             {
-                return;
+                Console.WriteLine($"[SENSOR] Não foi possível notificar {notificationType} de imediato a {session.Endpoint}.");
+                continue;
             }
 
-            string notifyMsg = $"NOTIFY|{sensorId}|{notificationType}|{payload}";
-            await writer.WriteLineAsync(notifyMsg);
-            string? response = await WaitForProtocolResponseAsync();
-            Console.WriteLine($"[SENSOR] Resposta: {response}");
+            sentCount++;
+            Console.WriteLine($"[SENSOR] Resposta de {session.Endpoint}: {response}");
         }
-        finally
+
+        if (sentCount == 0)
         {
-            socketLock.Release();
+            Console.WriteLine($"[SENSOR] Notificação {notificationType} não foi entregue a nenhum gateway.");
         }
     }
     catch (Exception ex)
@@ -1107,21 +1098,15 @@ async Task DesligarSensor()
         SetAutoSendEnabled(false);
         await Task.Delay(300);
 
-        if (ligado && writer != null && reader != null)
+        if (ligado && gatewaySessions.Count > 0)
         {
-            await socketLock.WaitAsync();
-            try
-            {
-                string discMsg = $"DISCONNECT|{sensorId}";
-                Console.WriteLine($"[SENSOR] A enviar: {discMsg}");
-                await writer.WriteLineAsync(discMsg);
+            string discMsg = $"DISCONNECT|{sensorId}";
+            Console.WriteLine($"[SENSOR] A enviar: {discMsg}");
 
-                string? response = await WaitForProtocolResponseAsync();
-                Console.WriteLine($"[SENSOR] Resposta: {response}");
-            }
-            finally
+            foreach (GatewaySession session in gatewaySessions.Where(session => session.IsConnected).ToList())
             {
-                socketLock.Release();
+                string? response = await session.SendRequestAsync(discMsg, timeoutSeconds: 5);
+                Console.WriteLine($"[SENSOR] Resposta de {session.Endpoint}: {response}");
             }
         }
     }
@@ -1142,15 +1127,133 @@ async Task FecharLigacaoLocal()
     aCarregar = false;
     SetAutoSendEnabled(false);
 
-    try { reader?.Dispose(); } catch { }
-    try { writer?.Dispose(); } catch { }
-    try { client?.Dispose(); } catch { }
+    foreach (GatewaySession session in gatewaySessions)
+    {
+        await session.CloseAsync();
+    }
 
-    reader = null;
-    writer = null;
-    client = null;
+    gatewaySessions.Clear();
 
     await Task.CompletedTask;
+}
+
+GatewaySession? SelectGatewaySession(string action)
+{
+    List<GatewaySession> connectedSessions = gatewaySessions
+        .Where(session => session.IsConnected)
+        .ToList();
+
+    if (connectedSessions.Count == 0)
+    {
+        Console.WriteLine($"[SENSOR] Não existe gateway ligado para {action}.");
+        return null;
+    }
+
+    if (connectedSessions.Count == 1)
+    {
+        return connectedSessions[0];
+    }
+
+    Console.WriteLine($"Escolhe o Gateway para {action}:");
+    for (int i = 0; i < connectedSessions.Count; i++)
+    {
+        Console.WriteLine($"{i + 1} - {connectedSessions[i].Endpoint}");
+    }
+
+    Console.Write("Opção: ");
+    string? input = Console.ReadLine()?.Trim();
+    if (!int.TryParse(input, out int selectedIndex) ||
+        selectedIndex < 1 ||
+        selectedIndex > connectedSessions.Count)
+    {
+        Console.WriteLine("[SENSOR] Gateway inválido.");
+        return null;
+    }
+
+    return connectedSessions[selectedIndex - 1];
+}
+
+List<GatewayEndpoint> ReadGatewayEndpoints()
+{
+    Console.WriteLine("Ligação de controlo aos Gateways:");
+    Console.WriteLine($"1 - Gateway principal ({DEFAULT_GATEWAY_IP}:{DEFAULT_GATEWAY_PORT})");
+    Console.WriteLine("2 - Escolher um Gateway específico");
+    Console.WriteLine("3 - Ligar a vários Gateways");
+    Console.Write("Opção (Enter para 1): ");
+
+    string option = Console.ReadLine()?.Trim() ?? "";
+    if (option == "2")
+    {
+        return new List<GatewayEndpoint> { ReadSingleGatewayEndpoint() };
+    }
+
+    if (option == "3")
+    {
+        Console.Write("Gateways (ex: 5000,5001 ou 127.0.0.1:5000;127.0.0.1:5001): ");
+        string input = Console.ReadLine()?.Trim() ?? "";
+        List<GatewayEndpoint> endpoints = input
+            .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ParseGatewayEndpoint)
+            .Where(endpoint => endpoint != null)
+            .Cast<GatewayEndpoint>()
+            .Distinct()
+            .ToList();
+
+        if (endpoints.Count > 0)
+        {
+            return endpoints;
+        }
+
+        Console.WriteLine("[SENSOR] Nenhum gateway válido indicado. Vai ser usado o Gateway principal.");
+    }
+
+    return new List<GatewayEndpoint> { new(DEFAULT_GATEWAY_IP, DEFAULT_GATEWAY_PORT) };
+}
+
+GatewayEndpoint ReadSingleGatewayEndpoint()
+{
+    Console.Write($"IP do Gateway (Enter para {DEFAULT_GATEWAY_IP}): ");
+    string host = Console.ReadLine()?.Trim() ?? "";
+    if (string.IsNullOrWhiteSpace(host))
+    {
+        host = DEFAULT_GATEWAY_IP;
+    }
+
+    Console.Write($"Porta do Gateway (Enter para {DEFAULT_GATEWAY_PORT}): ");
+    string portInput = Console.ReadLine()?.Trim() ?? "";
+    if (!int.TryParse(portInput, out int port) || port <= 0 || port > 65535)
+    {
+        port = DEFAULT_GATEWAY_PORT;
+    }
+
+    return new GatewayEndpoint(host, port);
+}
+
+GatewayEndpoint? ParseGatewayEndpoint(string input)
+{
+    string value = input.Trim();
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return null;
+    }
+
+    if (int.TryParse(value, out int onlyPort) && onlyPort > 0 && onlyPort <= 65535)
+    {
+        return new GatewayEndpoint(DEFAULT_GATEWAY_IP, onlyPort);
+    }
+
+    string[] parts = value.Split(':', 2, StringSplitOptions.TrimEntries);
+    if (parts.Length == 2 &&
+        !string.IsNullOrWhiteSpace(parts[0]) &&
+        int.TryParse(parts[1], out int port) &&
+        port > 0 &&
+        port <= 65535)
+    {
+        return new GatewayEndpoint(parts[0], port);
+    }
+
+    Console.WriteLine($"[SENSOR] Gateway inválido ignorado: {input}");
+    return null;
 }
 
 SensorConfig ReadStartupConfig()
@@ -1261,4 +1364,171 @@ class SensorConfig
     public string SensorId { get; set; } = "";
     public string Zona { get; set; } = "";
     public string TiposDados { get; set; } = "";
+}
+
+record GatewayEndpoint(string Host, int Port)
+{
+    public override string ToString() => $"{Host}:{Port}";
+}
+
+class GatewaySession
+{
+    private readonly SemaphoreSlim socketLock = new(1, 1);
+    private readonly SemaphoreSlim responseSignal = new(0);
+    private readonly ConcurrentQueue<string> responseQueue = new();
+    private TcpClient? client;
+    private StreamReader? reader;
+    private StreamWriter? writer;
+
+    public GatewaySession(GatewayEndpoint endpoint)
+    {
+        Endpoint = endpoint;
+    }
+
+    public GatewayEndpoint Endpoint { get; }
+    public bool IsConnected { get; private set; }
+
+    public async Task<string?> ConnectAsync(
+        string connectMessage,
+        Func<GatewaySession, string, Task> videoRequestHandler)
+    {
+        client = new TcpClient();
+        await client.ConnectAsync(Endpoint.Host, Endpoint.Port);
+
+        NetworkStream stream = client.GetStream();
+        reader = new StreamReader(stream, Encoding.UTF8);
+        writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+        IsConnected = true;
+
+        _ = Task.Run(() => ReceiveLoopAsync(videoRequestHandler));
+        return await SendRequestAsync(connectMessage);
+    }
+
+    public async Task<string?> SendRequestAsync(string message, int timeoutSeconds = 15)
+    {
+        if (!IsConnected || writer == null)
+        {
+            return null;
+        }
+
+        await socketLock.WaitAsync();
+        try
+        {
+            await writer.WriteLineAsync(message);
+            return await WaitForProtocolResponseAsync(timeoutSeconds);
+        }
+        finally
+        {
+            socketLock.Release();
+        }
+    }
+
+    public async Task<string?> TrySendRequestAsync(string message, int timeoutSeconds = 15)
+    {
+        if (!IsConnected || writer == null)
+        {
+            return null;
+        }
+
+        bool acquired = await socketLock.WaitAsync(0);
+        if (!acquired)
+        {
+            return null;
+        }
+
+        try
+        {
+            await writer.WriteLineAsync(message);
+            return await WaitForProtocolResponseAsync(timeoutSeconds);
+        }
+        finally
+        {
+            socketLock.Release();
+        }
+    }
+
+    public async Task SendOneWayAsync(string message)
+    {
+        if (!IsConnected || writer == null)
+        {
+            return;
+        }
+
+        await socketLock.WaitAsync();
+        try
+        {
+            await writer.WriteLineAsync(message);
+        }
+        finally
+        {
+            socketLock.Release();
+        }
+    }
+
+    public Task CloseAsync()
+    {
+        IsConnected = false;
+
+        try { reader?.Dispose(); } catch { }
+        try { writer?.Dispose(); } catch { }
+        try { client?.Dispose(); } catch { }
+
+        reader = null;
+        writer = null;
+        client = null;
+
+        responseQueue.Enqueue("ERROR|LIGACAO_FECHADA");
+        responseSignal.Release();
+
+        return Task.CompletedTask;
+    }
+
+    private async Task ReceiveLoopAsync(Func<GatewaySession, string, Task> videoRequestHandler)
+    {
+        try
+        {
+            while (IsConnected && reader != null)
+            {
+                string? line = await reader.ReadLineAsync();
+                if (line == null)
+                {
+                    break;
+                }
+
+                if (line.StartsWith("VIDEO_REQ|", StringComparison.OrdinalIgnoreCase))
+                {
+                    _ = Task.Run(() => videoRequestHandler(this, line));
+                    continue;
+                }
+
+                responseQueue.Enqueue(line);
+                responseSignal.Release();
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch
+        {
+        }
+        finally
+        {
+            IsConnected = false;
+            responseQueue.Enqueue("ERROR|LIGACAO_FECHADA");
+            responseSignal.Release();
+        }
+    }
+
+    private async Task<string?> WaitForProtocolResponseAsync(int timeoutSeconds)
+    {
+        bool received = await responseSignal.WaitAsync(TimeSpan.FromSeconds(timeoutSeconds));
+        if (!received)
+        {
+            return null;
+        }
+
+        return responseQueue.TryDequeue(out string? response)
+            ? response
+            : null;
+    }
 }

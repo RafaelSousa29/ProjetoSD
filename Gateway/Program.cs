@@ -1,30 +1,47 @@
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
+using System.Threading;
 
-const int GATEWAY_PORT = 5000;
+const int DEFAULT_GATEWAY_PORT = 5000;
 const string SERVER_IP = "127.0.0.1";
 const int SERVER_PORT = 6000;
-const string GATEWAY_ID = "GW01";
+const string PREPROCESS_RPC_IP = "127.0.0.1";
+const int PREPROCESS_RPC_PORT = 7000;
+const string RABBITMQ_HOST = "localhost";
+const string RABBITMQ_EXCHANGE = "onehealth.medicoes";
+const string RABBITMQ_QUEUE_PREFIX = "onehealth.gateway";
+const string DEFAULT_GATEWAY_ID = "GW01";
 const string CSV_FILE = "sensors.csv";
-const string HISTORY_FILE = "gateway_history.txt";
+const string CSV_MUTEX_NAME = "ProjetoSD_GatewaySensorsCsv";
+const string HISTORY_FILE_PREFIX = "gateway_history";
 const string SENSOR_PROFILES_RELATIVE_PATH = "..\\Sensor\\profiles";
 const string VIDEO_STREAMS_FOLDER = "video_streams";
 const int MAX_BATCH_SIZE = 20;
 const int BATCH_TIMEOUT_MS = 300000;
 const int SENSOR_TIMEOUT_MS = 30000;
 const int MONITOR_INTERVAL_MS = 5000;
-const int DEFAULT_VIDEO_FRAME_COUNT = 10;
 const string STATE_ACTIVE = "ativo";
 const string STATE_MAINTENANCE = "manutencao";
 const string STATE_DISABLED = "desativado";
 const string STATE_INACTIVE = "inativo";
 string[] SUPPORTED_DATA_TYPES = ["TEMP", "HUM", "RUIDO", "PM2.5", "PM10", "LUM", "AQ"];
 
+GatewayConfig gatewayConfig = ReadGatewayStartupConfig();
+string gatewayId = gatewayConfig.GatewayId;
+int gatewayPort = gatewayConfig.Port;
+List<string> subscribedTopics = gatewayConfig.Topics;
+string historyFile = $"{HISTORY_FILE_PREFIX}_{gatewayId}.txt";
+
 List<string> dataBuffer = new();
 Lock dataBufferLock = new();
 Lock csvLock = new();
+Mutex csvFileMutex = new(false, CSV_MUTEX_NAME);
 Lock historyLock = new();
 Lock pendingFilesLock = new();
 SemaphoreSlim batchSendLock = new(1, 1);
@@ -37,15 +54,17 @@ ConcurrentDictionary<string, string> manualStateOverrides = new(StringComparer.O
 EnsureCsvExists();
 LoadPendingBuffer();
 
-TcpListener listener = new(IPAddress.Any, GATEWAY_PORT);
+TcpListener listener = new(IPAddress.Any, gatewayPort); // Inicialização do Socket Servidor ( Gateway escuta os Sensores )
 listener.Start();
 
-Console.WriteLine($"[GATEWAY {GATEWAY_ID}] Ativo na porta {GATEWAY_PORT}...");
+Console.WriteLine($"[GATEWAY {gatewayId}] Ativo na porta {gatewayPort}...");
+Console.WriteLine($"[RABBITMQ] Tópicos configurados: {string.Join(", ", subscribedTopics)}");
 Console.WriteLine("Comandos disponíveis: 'send', 'status', 'create' e 'state'.");
 
 _ = Task.Run(BatchTimerLoop);
 _ = Task.Run(ManualCommandLoop);
 _ = Task.Run(MonitorSensorsLoop);
+_ = Task.Run(RabbitMqSubscriptionLoop);
 
 while (true)
 {
@@ -183,14 +202,22 @@ async Task HandleSensorAsync(TcpClient client)
                             break;
                         }
 
-                        string normalizedData = $"DATA|{sensorId}|{timestamp}|{tipoDado.ToUpperInvariant()}|{valor}";
+                        PreprocessResult preprocessResult = await PreprocessMeasurementAsync(sensorId, timestamp, tipoDado, valor);
+                        if (!preprocessResult.Success)
+                        {
+                            await writer.WriteLineAsync($"DATA_ACK|ERRO|PREPROCESSAMENTO|{preprocessResult.Error}");
+                            Console.WriteLine($"[RPC PRE] Medição rejeitada para {currentSensorId}: {preprocessResult.Error}");
+                            break;
+                        }
+
+                        string normalizedData = preprocessResult.Data;
 
                         LogDataLocally(normalizedData);
                         QueueData(normalizedData);
                         RegisterSensorSeen(currentSensorId);
                         ApplyAutomaticStateUpdate(currentSensorId, STATE_ACTIVE, DateTime.UtcNow);
 
-                        Console.WriteLine($"[RECEBIDO] Sensor {currentSensorId} enviou {tipoDado}: {valor}");
+                        Console.WriteLine($"[RECEBIDO] Sensor {currentSensorId} enviou {tipoDado}: {valor} -> {preprocessResult.Value}");
                         await writer.WriteLineAsync("DATA_ACK|SUCESSO");
                         break;
 
@@ -258,21 +285,6 @@ async Task HandleSensorAsync(TcpClient client)
                         }
                         break;
 
-                    case "VIDEO_ACK":
-                        if (!isConnected || currentSensorId == null)
-                        {
-                            break;
-                        }
-
-                        if (activeSessions.TryGetValue(currentSensorId, out SensorSession? videoSession))
-                        {
-                            string payload = parts.Length >= 3
-                                ? string.Join('|', parts.Skip(2))
-                                : "ERRO|SEM_PAYLOAD";
-                            videoSession.TryCompleteVideoAck(payload);
-                        }
-                        break;
-
                     case "VIDEO_REQ":
                         if (!isConnected || currentSensorId == null)
                         {
@@ -324,7 +336,7 @@ async Task HandleSensorAsync(TcpClient client)
     }
 }
 
-void QueueData(string data)
+void QueueData(string data) // Agregação e envio ao Servidor
 {
     bool shouldSend;
     string tipoDado = ExtractDataType(data);
@@ -369,11 +381,9 @@ async Task ForwardBatchToServerAsync()
             using StreamWriter sw = new(stream, Encoding.UTF8) { AutoFlush = true };
             using StreamReader sr = new(stream, Encoding.UTF8);
 
-            await sw.WriteLineAsync($"DATA_BATCH|{GATEWAY_ID}|{batch.Count}");
-            foreach (string measurement in batch)
-            {
-                await sw.WriteLineAsync(measurement);
-            }
+            string structuredBatchJson = BuildStructuredBatchJson(batch);
+            await sw.WriteLineAsync($"DATA_BATCH_JSON|{gatewayId}|1");
+            await sw.WriteLineAsync(structuredBatchJson);
             await sw.WriteLineAsync("END");
 
             string? ack = await sr.ReadLineAsync();
@@ -385,7 +395,7 @@ async Task ForwardBatchToServerAsync()
             }
 
             MarkBatchAsDelivered(batch.Count);
-            Console.WriteLine($"[BATCH] Lote de {batch.Count} medições enviado com sucesso.");
+            Console.WriteLine($"[BATCH] Lote estruturado de {batch.Count} medições enviado com sucesso.");
         }
         catch (Exception ex)
         {
@@ -395,6 +405,295 @@ async Task ForwardBatchToServerAsync()
     finally
     {
         batchSendLock.Release();
+    }
+}
+
+string BuildStructuredBatchJson(List<string> batch)
+{
+    List<GatewayBatchMeasurementDto> measurements = batch
+        .Select(ParseBatchMeasurement)
+        .Where(measurement => measurement != null)
+        .Cast<GatewayBatchMeasurementDto>()
+        .ToList();
+
+    Dictionary<string, GatewayBatchSummaryDto> summaryByType = measurements
+        .GroupBy(measurement => measurement.Type, StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(
+            group => group.Key,
+            group => BuildBatchSummary(group.ToList()),
+            StringComparer.OrdinalIgnoreCase);
+
+    string sentAt = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss");
+    GatewayBatchDto payload = new(
+        GatewayId: gatewayId,
+        BatchId: $"{gatewayId}-{DateTime.UtcNow:yyyyMMddHHmmssfff}",
+        SentAt: sentAt,
+        TotalRecords: measurements.Count,
+        Measurements: measurements,
+        SummaryByType: summaryByType);
+
+    return JsonSerializer.Serialize(payload, new JsonSerializerOptions
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    });
+}
+
+GatewayBatchMeasurementDto? ParseBatchMeasurement(string data)
+{
+    string[] parts = data.Split('|');
+    if (parts.Length < 5 || !parts[0].Equals("DATA", StringComparison.OrdinalIgnoreCase))
+    {
+        return null;
+    }
+
+    return new GatewayBatchMeasurementDto(
+        SensorId: parts[1].Trim(),
+        Timestamp: parts[2].Trim(),
+        Type: parts[3].Trim().ToUpperInvariant(),
+        Value: parts[4].Trim());
+}
+
+GatewayBatchSummaryDto BuildBatchSummary(List<GatewayBatchMeasurementDto> measurements)
+{
+    List<double> numericValues = measurements
+        .Select(measurement => TryParseInvariantDouble(measurement.Value, out double value) ? value : (double?)null)
+        .Where(value => value.HasValue)
+        .Select(value => value!.Value)
+        .ToList();
+
+    if (numericValues.Count == 0)
+    {
+        return new GatewayBatchSummaryDto(measurements.Count, "-", "-", "-");
+    }
+
+    return new GatewayBatchSummaryDto(
+        Count: measurements.Count,
+        Min: FormatInvariant(numericValues.Min()),
+        Max: FormatInvariant(numericValues.Max()),
+        Avg: FormatInvariant(numericValues.Average()));
+}
+
+bool TryParseInvariantDouble(string value, out double result)
+{
+    return double.TryParse(
+        value.Replace(',', '.'),
+        NumberStyles.Float,
+        CultureInfo.InvariantCulture,
+        out result);
+}
+
+string FormatInvariant(double value)
+{
+    return value.ToString("0.##", CultureInfo.InvariantCulture);
+}
+
+async Task RabbitMqSubscriptionLoop()
+{
+    string queueName = BuildGatewayQueueName();
+
+    while (true)
+    {
+        try
+        {
+            ConnectionFactory factory = new()
+            {
+                HostName = RABBITMQ_HOST,
+                DispatchConsumersAsync = true,
+                AutomaticRecoveryEnabled = true
+            };
+
+            using IConnection connection = factory.CreateConnection();
+            using IModel channel = connection.CreateModel();
+
+            channel.ExchangeDeclare(
+                exchange: RABBITMQ_EXCHANGE,
+                type: ExchangeType.Topic,
+                durable: true,
+                autoDelete: false);
+
+            channel.QueueDeclare(
+                queue: queueName,
+                durable: true,
+                exclusive: false,
+                autoDelete: false);
+
+            foreach (string topic in subscribedTopics)
+            {
+                channel.QueueBind(
+                    queue: queueName,
+                    exchange: RABBITMQ_EXCHANGE,
+                    routingKey: topic);
+            }
+
+            channel.BasicQos(prefetchSize: 0, prefetchCount: 10, global: false);
+
+            AsyncEventingBasicConsumer consumer = new(channel);
+            consumer.Received += async (_, eventArgs) =>
+            {
+                string topic = eventArgs.RoutingKey;
+                string payload = Encoding.UTF8.GetString(eventArgs.Body.ToArray());
+
+                try
+                {
+                    await HandlePubSubMessageAsync($"MESSAGE|{topic}|{payload}");
+                    channel.BasicAck(eventArgs.DeliveryTag, multiple: false);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[RABBITMQ] Erro ao processar mensagem: {ex.Message}");
+                    channel.BasicNack(eventArgs.DeliveryTag, multiple: false, requeue: true);
+                }
+            };
+
+            channel.BasicConsume(queue: queueName, autoAck: false, consumer: consumer);
+            Console.WriteLine($"[RABBITMQ] Gateway subscrito na queue '{queueName}' com routing keys: {string.Join(", ", subscribedTopics)}.");
+
+            while (connection.IsOpen)
+            {
+                await Task.Delay(1000);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[RABBITMQ] Broker indisponível: {ex.Message}");
+        }
+
+        await Task.Delay(3000);
+    }
+}
+
+async Task HandlePubSubMessageAsync(string message)
+{
+    string[] messageParts = message.Split('|', 3);
+    if (messageParts.Length < 3 || !messageParts[0].Equals("MESSAGE", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[PUBSUB] Mensagem inválida: {message}");
+        return;
+    }
+
+    string topic = messageParts[1].Trim();
+    string payload = messageParts[2];
+    string[] topicParts = topic.Contains('.')
+        ? topic.Split('.')
+        : topic.Split('/');
+    if (topicParts.Length < 3 || !topicParts[0].Equals("DATA", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[PUBSUB] Tópico inválido: {topic}");
+        return;
+    }
+
+    string? topicSensorId = null;
+    string topicZone;
+    string topicType;
+
+    if (topicParts.Length >= 4 && IsSensorIdFilter(topicParts[1].Trim().ToUpperInvariant()))
+    {
+        topicSensorId = topicParts[1].Trim();
+        topicZone = topicParts[2].Trim();
+        topicType = string.Join('.', topicParts.Skip(3)).Trim();
+    }
+    else
+    {
+        topicZone = topicParts[1].Trim();
+        topicType = string.Join('.', topicParts.Skip(2)).Trim();
+    }
+    string[] dataParts = payload.Split('|');
+    if (dataParts.Length < 5 || !dataParts[0].Equals("DATA", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[PUBSUB] Payload inválido: {payload}");
+        return;
+    }
+
+    string sensorId = dataParts[1].Trim();
+    string timestamp = dataParts[2].Trim();
+    string tipoDado = dataParts[3].Trim();
+    string valor = dataParts[4].Trim();
+
+    SensorInfo? sensorInfo = FindSensor(sensorId);
+    if (sensorInfo == null || sensorInfo.Estado == STATE_DISABLED)
+    {
+        Console.WriteLine($"[PUBSUB] Medição ignorada de sensor inválido/desativado: {sensorId}");
+        return;
+    }
+
+    if ((topicSensorId != null && !topicSensorId.Equals(sensorId, StringComparison.OrdinalIgnoreCase)) ||
+        !sensorInfo.Zona.Equals(topicZone, StringComparison.OrdinalIgnoreCase) ||
+        !sensorInfo.TiposDados.Any(tipo => tipo.Equals(tipoDado, StringComparison.OrdinalIgnoreCase)) ||
+        !topicType.Equals(tipoDado, StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[PUBSUB] Medição rejeitada por tópico/tipo não autorizado: {sensorId} em {topic}");
+        return;
+    }
+
+    if (string.IsNullOrWhiteSpace(valor))
+    {
+        Console.WriteLine($"[PUBSUB] Medição rejeitada por valor inválido: {sensorId}");
+        return;
+    }
+
+    PreprocessResult preprocessResult = await PreprocessMeasurementAsync(sensorId, timestamp, tipoDado, valor);
+    if (!preprocessResult.Success)
+    {
+        Console.WriteLine($"[PUBSUB] Pré-processamento rejeitou {sensorId}: {preprocessResult.Error}");
+        return;
+    }
+
+    string normalizedData = preprocessResult.Data;
+    LogDataLocally(normalizedData);
+    QueueData(normalizedData);
+    sensorStatusReasons[sensorId] = $"Dados recebidos por Pub/Sub no tópico {topic}.";
+    ApplyAutomaticStateUpdate(sensorId, STATE_ACTIVE, DateTime.UtcNow);
+
+    Console.WriteLine($"[PUBSUB] {sensorId} publicou {tipoDado}: {valor} -> {preprocessResult.Value}");
+}
+
+async Task<PreprocessResult> PreprocessMeasurementAsync(string sensorId, string timestamp, string tipoDado, string valor)
+{
+    try
+    {
+        using TcpClient rpcClient = new();
+        await rpcClient.ConnectAsync(PREPROCESS_RPC_IP, PREPROCESS_RPC_PORT).WaitAsync(TimeSpan.FromSeconds(3));
+
+        using NetworkStream stream = rpcClient.GetStream();
+        using StreamWriter writer = new(stream, Encoding.UTF8) { AutoFlush = true };
+        using StreamReader reader = new(stream, Encoding.UTF8);
+
+        await writer.WriteLineAsync($"PREPROCESS|{gatewayId}|{sensorId}|{timestamp}|{tipoDado}|{valor}");
+        string? response = await reader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(3));
+
+        if (response == null)
+        {
+            return PreprocessResult.Fail("SEM_RESPOSTA_RPC");
+        }
+
+        string[] parts = response.Split('|');
+        if (parts.Length < 2 || !parts[0].Equals("PREPROCESS_ACK", StringComparison.OrdinalIgnoreCase))
+        {
+            return PreprocessResult.Fail("RESPOSTA_RPC_INVALIDA");
+        }
+
+        if (!parts[1].Equals("SUCESSO", StringComparison.OrdinalIgnoreCase))
+        {
+            string error = parts.Length >= 3 ? parts[2] : "ERRO_RPC";
+            return PreprocessResult.Fail(error);
+        }
+
+        if (parts.Length < 6)
+        {
+            return PreprocessResult.Fail("RESPOSTA_RPC_INCOMPLETA");
+        }
+
+        string normalizedSensorId = parts[2].Trim();
+        string normalizedTimestamp = parts[3].Trim();
+        string normalizedType = parts[4].Trim().ToUpperInvariant();
+        string normalizedValue = parts[5].Trim();
+        string data = $"DATA|{normalizedSensorId}|{normalizedTimestamp}|{normalizedType}|{normalizedValue}";
+
+        return PreprocessResult.Ok(data, normalizedValue);
+    }
+    catch (Exception ex)
+    {
+        return PreprocessResult.Fail($"RPC_INDISPONIVEL:{ex.Message}");
     }
 }
 
@@ -453,87 +752,6 @@ async Task ManualCommandLoop()
         {
             ChangeSensorStateInteractive();
         }
-        else if (cmd == "video")
-        {
-            await RequestVideoInteractiveAsync();
-        }
-    }
-}
-
-async Task RequestVideoInteractiveAsync()
-{
-    Console.Write("ID do sensor para vídeo: ");
-    string sensorId = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
-
-    if (string.IsNullOrWhiteSpace(sensorId))
-    {
-        Console.WriteLine("[VIDEO] ID inválido.");
-        return;
-    }
-
-    SensorInfo? sensor = FindSensor(sensorId);
-    if (sensor == null)
-    {
-        Console.WriteLine($"[VIDEO] Sensor {sensorId} não encontrado.");
-        return;
-    }
-
-    if (sensor.Estado != STATE_ACTIVE)
-    {
-        Console.WriteLine($"[VIDEO] O sensor {sensorId} não está ativo.");
-        return;
-    }
-
-    if (!activeSessions.TryGetValue(sensorId, out SensorSession? session))
-    {
-        Console.WriteLine($"[VIDEO] O sensor {sensorId} não está ligado ao gateway.");
-        return;
-    }
-
-    Console.Write($"Número de frames simulados (Enter para {DEFAULT_VIDEO_FRAME_COUNT}): ");
-    string? input = Console.ReadLine()?.Trim();
-    int frameCount = DEFAULT_VIDEO_FRAME_COUNT;
-    if (!string.IsNullOrWhiteSpace(input) && (!int.TryParse(input, out frameCount) || frameCount <= 0))
-    {
-        Console.WriteLine("[VIDEO] Número de frames inválido.");
-        return;
-    }
-
-    Directory.CreateDirectory(Path.Combine(Environment.CurrentDirectory, VIDEO_STREAMS_FOLDER));
-
-    using TcpListener videoListener = new(IPAddress.Any, 0);
-    videoListener.Start();
-
-    int videoPort = ((IPEndPoint)videoListener.LocalEndpoint).Port;
-    TaskCompletionSource<string> videoAck = session.CreatePendingVideoAck();
-
-    try
-    {
-        await session.SendAsync($"VIDEO_REQ|{sensorId}|{videoPort}|{frameCount}");
-        string ackPayload = await videoAck.Task.WaitAsync(TimeSpan.FromSeconds(10));
-
-        if (!ackPayload.StartsWith("ACEITE|", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine($"[VIDEO] Pedido recusado pelo sensor {sensorId}: {ackPayload}");
-            return;
-        }
-
-        Console.WriteLine($"[VIDEO] Sensor {sensorId} aceitou o pedido. A receber stream na porta {videoPort}...");
-        using TcpClient videoClient = await videoListener.AcceptTcpClientAsync().WaitAsync(TimeSpan.FromSeconds(15));
-        string savedPath = await ReceiveVideoStreamAsync(sensorId, videoClient);
-        Console.WriteLine($"[VIDEO] Stream guardada em {savedPath}");
-    }
-    catch (TimeoutException)
-    {
-        Console.WriteLine($"[VIDEO] Timeout à espera da resposta ou da stream do sensor {sensorId}.");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[VIDEO] Erro na sessão de vídeo: {ex.Message}");
-    }
-    finally
-    {
-        session.ClearPendingVideoAck(videoAck);
     }
 }
 
@@ -632,7 +850,7 @@ async Task ForwardVideoBatchToServerAsync(string sensorId, List<string> videoLin
         using StreamWriter sw = new(stream, Encoding.UTF8) { AutoFlush = true };
         using StreamReader sr = new(stream, Encoding.UTF8);
 
-        await sw.WriteLineAsync($"VIDEO_BATCH|{GATEWAY_ID}|{sensorId}|{videoLines.Count}");
+        await sw.WriteLineAsync($"VIDEO_BATCH|{gatewayId}|{sensorId}|{videoLines.Count}");
         foreach (string line in videoLines)
         {
             await sw.WriteLineAsync(line);
@@ -654,7 +872,7 @@ async Task ForwardVideoBatchToServerAsync(string sensorId, List<string> videoLin
     }
 }
 
-async Task MonitorSensorsLoop()
+async Task MonitorSensorsLoop() // Monitorização de sensores ( timeouts e heartbeats )
 {
     while (true)
     {
@@ -791,7 +1009,7 @@ bool CanManuallySetActive(string sensorId, out string? reason)
 
 void UpdateSensorEntry(string id, string estado, DateTime timestampUtc)
 {
-    lock (csvLock)
+    WithCsvFileLock(() =>
     {
         List<string> lines = File.ReadAllLines(CSV_FILE).ToList();
 
@@ -815,14 +1033,14 @@ void UpdateSensorEntry(string id, string estado, DateTime timestampUtc)
         }
 
         File.WriteAllLines(CSV_FILE, lines);
-    }
+    });
 }
 
 void LogDataLocally(string data)
 {
     lock (historyLock)
     {
-        File.AppendAllText(HISTORY_FILE, $"[{DateTime.Now:yyyy-MM-ddTHH:mm:ss}] {data}{Environment.NewLine}");
+        File.AppendAllText(historyFile, $"[{DateTime.Now:yyyy-MM-ddTHH:mm:ss}] {data}{Environment.NewLine}");
     }
 }
 
@@ -830,7 +1048,7 @@ void LoadPendingBuffer()
 {
     lock (dataBufferLock)
     {
-        dataBuffer = Directory.GetFiles(Environment.CurrentDirectory, "pending_*.txt")
+        dataBuffer = Directory.GetFiles(Environment.CurrentDirectory, $"pending_{gatewayId}_*.txt")
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .SelectMany(path => File.ReadAllLines(path)
                 .Where(line => !string.IsNullOrWhiteSpace(line)))
@@ -876,13 +1094,51 @@ void RemovePendingMeasurement(string tipoDado, string data)
 string GetPendingFilePath(string tipoDado)
 {
     string safeType = tipoDado.ToUpperInvariant().Replace('.', '_');
-    return Path.Combine(Environment.CurrentDirectory, $"pending_{safeType}.txt");
+    return Path.Combine(Environment.CurrentDirectory, $"pending_{gatewayId}_{safeType}.txt");
 }
 
 string ExtractDataType(string data)
 {
     string[] parts = data.Split('|');
     return parts.Length >= 4 ? parts[3].Trim() : "UNKNOWN";
+}
+
+void WithCsvFileLock(Action action)
+{
+    WithCsvFileLockResult(() =>
+    {
+        action();
+        return true;
+    });
+}
+
+T WithCsvFileLockResult<T>(Func<T> action)
+{
+    lock (csvLock)
+    {
+        bool mutexAcquired = false;
+        try
+        {
+            try
+            {
+                csvFileMutex.WaitOne();
+            }
+            catch (AbandonedMutexException)
+            {
+                // Outro Gateway terminou enquanto tinha o mutex; a posse passa para este processo.
+            }
+
+            mutexAcquired = true;
+            return action();
+        }
+        finally
+        {
+            if (mutexAcquired)
+            {
+                csvFileMutex.ReleaseMutex();
+            }
+        }
+    }
 }
 
 SensorInfo? FindSensor(string sensorId)
@@ -893,7 +1149,7 @@ SensorInfo? FindSensor(string sensorId)
 
 List<SensorInfo> ReadSensors()
 {
-    lock (csvLock)
+    return WithCsvFileLockResult(() =>
     {
         if (!File.Exists(CSV_FILE))
         {
@@ -906,7 +1162,7 @@ List<SensorInfo> ReadSensors()
             .Where(sensor => sensor != null)
             .Cast<SensorInfo>()
             .ToList();
-    }
+    });
 }
 
 SensorInfo? ParseSensorInfo(string line)
@@ -933,19 +1189,22 @@ SensorInfo? ParseSensorInfo(string line)
 
 void EnsureCsvExists()
 {
-    if (File.Exists(CSV_FILE))
+    WithCsvFileLock(() =>
     {
-        return;
-    }
+        if (File.Exists(CSV_FILE))
+        {
+            return;
+        }
 
-    File.WriteAllLines(CSV_FILE, new[]
-    {
-        "sensor_id;estado;zona;tipos_dados;last_sync",
-        "S101;ativo;ZONA_PARQUE;TEMP,HUM,RUIDO;-",
-        "S102;ativo;ZONA_ESCOLAR;TEMP,PM2.5,RUIDO;-",
-        "S103;desativado;ZONA_CENTRO;TEMP,HUM;-",
-        "S104;ativo;ZONA_PASSEIO;TEMP,HUM,RUIDO;-",
-        "S105;ativo;ZONA_ESCOLAR;TEMP,HUM,RUIDO;-"
+        File.WriteAllLines(CSV_FILE, new[]
+        {
+            "sensor_id;estado;zona;tipos_dados;last_sync",
+            "S101;ativo;ZONA_PARQUE;TEMP,HUM,RUIDO;-",
+            "S102;ativo;ZONA_ESCOLAR;TEMP,PM2.5,RUIDO;-",
+            "S103;desativado;ZONA_CENTRO;TEMP,HUM;-",
+            "S104;ativo;ZONA_PASSEIO;TEMP,HUM,RUIDO;-",
+            "S105;ativo;ZONA_ESCOLAR;TEMP,HUM,RUIDO;-"
+        });
     });
 }
 
@@ -1018,7 +1277,7 @@ void CreateSensorInteractive()
 
 void AddSensorToCsv(string sensorId, string estado, string zona, List<string> tipos)
 {
-    lock (csvLock)
+    WithCsvFileLock(() =>
     {
         string line = string.Join(';', new[]
         {
@@ -1030,7 +1289,7 @@ void AddSensorToCsv(string sensorId, string estado, string zona, List<string> ti
         });
 
         File.AppendAllLines(CSV_FILE, new[] { line });
-    }
+    });
 }
 
 void ChangeSensorStateInteractive()
@@ -1101,6 +1360,135 @@ void CreateSensorProfile(string sensorId, string zona, List<string> tipos)
     Console.WriteLine($"[CREATE] Perfil criado em {profilePath}");
 }
 
+GatewayConfig ReadGatewayStartupConfig()
+{
+    Console.WriteLine("===== CONFIGURAÇÃO DO GATEWAY =====");
+    Console.Write($"ID do Gateway (Enter para {DEFAULT_GATEWAY_ID}): ");
+    string gatewayInput = (Console.ReadLine() ?? "").Trim().ToUpperInvariant();
+    string configuredGatewayId = string.IsNullOrWhiteSpace(gatewayInput)
+        ? DEFAULT_GATEWAY_ID
+        : gatewayInput;
+
+    Console.Write($"Porta TCP do Gateway (Enter para {DEFAULT_GATEWAY_PORT}): ");
+    string portInput = (Console.ReadLine() ?? "").Trim();
+    int configuredPort = DEFAULT_GATEWAY_PORT;
+    if (!string.IsNullOrWhiteSpace(portInput) &&
+        (!int.TryParse(portInput, out configuredPort) || configuredPort <= 0 || configuredPort > 65535))
+    {
+        Console.WriteLine($"[GATEWAY] Porta inválida. Vai ser usada a porta {DEFAULT_GATEWAY_PORT}.");
+        configuredPort = DEFAULT_GATEWAY_PORT;
+    }
+
+    Console.WriteLine("Tópicos disponíveis:");
+    Console.WriteLine("  all ou *          -> DATA.#");
+    Console.WriteLine("  TEMP              -> DATA.*.*.TEMP");
+    Console.WriteLine("  RUIDO             -> DATA.*.*.RUIDO");
+    Console.WriteLine("  PM2.5             -> DATA.*.*.PM2.5");
+    Console.WriteLine("  S105              -> DATA.S105.#");
+    Console.WriteLine("  S105:TEMP         -> DATA.S105.*.TEMP");
+    Console.WriteLine("  DATA.S105.*.TEMP  -> tópico RabbitMQ completo");
+    Console.Write("Tópicos a subscrever separados por vírgula (Enter para all): ");
+    string topicsInput = Console.ReadLine() ?? "";
+    List<string> topics = ParseGatewayTopics(topicsInput);
+
+    return new GatewayConfig(configuredGatewayId, configuredPort, topics);
+}
+
+List<string> ParseGatewayTopics(string input)
+{
+    List<string> topics = input
+        .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(NormalizeGatewayTopic)
+        .Where(topic => !string.IsNullOrWhiteSpace(topic))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    return topics.Count == 0
+        ? new List<string> { "DATA.#" }
+        : topics;
+}
+
+string NormalizeGatewayTopic(string rawTopic)
+{
+    string topic = rawTopic.Trim().ToUpperInvariant();
+
+    if (topic == "*" || topic == "ALL" || topic == "TODOS")
+    {
+        return "DATA.#";
+    }
+
+    if (SUPPORTED_DATA_TYPES.Contains(topic, StringComparer.OrdinalIgnoreCase))
+    {
+        return $"DATA.*.*.{topic}";
+    }
+
+    if (topic.Contains(':'))
+    {
+        string[] parts = topic.Split(':', 2, StringSplitOptions.TrimEntries);
+        if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[0]))
+        {
+            string sensorFilter = parts[0].Trim().ToUpperInvariant();
+            string typeFilter = parts[1].Trim().ToUpperInvariant();
+
+            if (typeFilter == "*" || typeFilter == "ALL" || typeFilter == "TODOS")
+            {
+                return $"DATA.{sensorFilter}.#";
+            }
+
+            if (SUPPORTED_DATA_TYPES.Contains(typeFilter, StringComparer.OrdinalIgnoreCase))
+            {
+                return $"DATA.{sensorFilter}.*.{typeFilter}";
+            }
+        }
+    }
+
+    if (IsSensorIdFilter(topic))
+    {
+        return $"DATA.{topic}.#";
+    }
+
+    if (topic.StartsWith("DATA.", StringComparison.OrdinalIgnoreCase))
+    {
+        return topic;
+    }
+
+    Console.WriteLine($"[GATEWAY] Tópico '{rawTopic}' não reconhecido. Ignorado.");
+    return "";
+}
+
+bool IsSensorIdFilter(string topic)
+{
+    if (string.IsNullOrWhiteSpace(topic) || topic.Contains('.') || topic.Contains('*') || topic.Contains('#'))
+    {
+        return false;
+    }
+
+    return topic.StartsWith('S') && topic.Skip(1).Any(char.IsDigit);
+}
+
+string BuildGatewayQueueName()
+{
+    string topicSuffix = string.Join("_", subscribedTopics.Select(SanitizeQueueSegment));
+    if (topicSuffix.Length > 80)
+    {
+        topicSuffix = topicSuffix[..80];
+    }
+
+    return $"{RABBITMQ_QUEUE_PREFIX}.{gatewayId}.{topicSuffix}";
+}
+
+string SanitizeQueueSegment(string value)
+{
+    StringBuilder builder = new();
+
+    foreach (char character in value.ToUpperInvariant())
+    {
+        builder.Append(char.IsLetterOrDigit(character) ? character : '_');
+    }
+
+    return builder.ToString().Trim('_');
+}
+
 class SensorInfo
 {
     public string SensorId { get; set; } = "";
@@ -1110,10 +1498,29 @@ class SensorInfo
     public string LastSync { get; set; } = "-";
 }
 
+record GatewayConfig(string GatewayId, int Port, List<string> Topics);
+
+record GatewayBatchDto(
+    string GatewayId,
+    string BatchId,
+    string SentAt,
+    int TotalRecords,
+    List<GatewayBatchMeasurementDto> Measurements,
+    Dictionary<string, GatewayBatchSummaryDto> SummaryByType);
+
+record GatewayBatchMeasurementDto(string SensorId, string Timestamp, string Type, string Value);
+
+record GatewayBatchSummaryDto(int Count, string Min, string Max, string Avg);
+
+record PreprocessResult(bool Success, string Data, string Value, string Error)
+{
+    public static PreprocessResult Ok(string data, string value) => new(true, data, value, "");
+    public static PreprocessResult Fail(string error) => new(false, "", "", error);
+}
+
 class SensorSession
 {
     private readonly StreamWriter writer;
-    private TaskCompletionSource<string>? pendingVideoAck;
 
     public SensorSession(string sensorId, StreamWriter writer)
     {
@@ -1134,28 +1541,6 @@ class SensorSession
         finally
         {
             WriteLock.Release();
-        }
-    }
-
-    public TaskCompletionSource<string> CreatePendingVideoAck()
-    {
-        TaskCompletionSource<string> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        Interlocked.Exchange(ref pendingVideoAck, tcs);
-        return tcs;
-    }
-
-    public void TryCompleteVideoAck(string payload)
-    {
-        TaskCompletionSource<string>? current = Interlocked.Exchange(ref pendingVideoAck, null);
-        current?.TrySetResult(payload);
-    }
-
-    public void ClearPendingVideoAck(TaskCompletionSource<string> expected)
-    {
-        TaskCompletionSource<string>? current = Interlocked.CompareExchange(ref pendingVideoAck, null, expected);
-        if (current == expected)
-        {
-            expected.TrySetCanceled();
         }
     }
 }

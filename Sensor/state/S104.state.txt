@@ -1,0 +1,7 @@
+sensor_id=S104
+battery_level=19
+auto_send_enabled=True
+auto_send_interval_seconds=5
+resume_auto_send_after_charging=True
+maintenance_reason=Bateria fraca
+updated_at=2026-05-12T11:53:12

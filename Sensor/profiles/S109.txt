@@ -1,0 +1,3 @@
+sensor_id=S109
+zona=ZONA_CENTRAL
+tipos_dados=TEMP
