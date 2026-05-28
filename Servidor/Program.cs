@@ -1236,31 +1236,31 @@ string GetDashboardHtml() =>
   <title>OneHealth Dashboard</title>
   <style>
     :root {
-      --ink: #16201b;
-      --muted: #657069;
-      --paper: #f5f1e8;
-      --card: rgba(255, 252, 245, .84);
-      --line: rgba(22, 32, 27, .13);
-      --green: #0f6b4f;
-      --mint: #98d9bd;
-      --amber: #e3a72f;
-      --red: #b94a48;
-      --blue: #315f8f;
-      --shadow: 0 24px 70px rgba(33, 45, 38, .16);
-    }
+  --ink: #0f172a;       /* Tom escuro azulado */
+  --muted: #64748b;     /* Cinza azulado para texto secundário */
+  --paper: #f8fafc;
+  --card: rgba(255, 255, 255, 0.84);
+  --line: rgba(15, 23, 42, 0.13);
+  --green: #2563eb;     /* Substituído por Azul Principal */
+  --mint: #93c5fd;      /* Substituído por Azul Claro */
+  --amber: #e3a72f;
+  --red: #b94a48;
+  --blue: #1e3a8a;      /* Azul escuro secundário */
+  --shadow: 0 24px 70px rgba(15, 23, 42, 0.16);
+}
 
     * { box-sizing: border-box; }
 
     body {
-      margin: 0;
-      color: var(--ink);
-      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(152, 217, 189, .75), transparent 32rem),
-        radial-gradient(circle at 88% 8%, rgba(227, 167, 47, .28), transparent 24rem),
-        linear-gradient(135deg, #f7f2e7 0%, #e7efe5 48%, #f3ead7 100%);
-      min-height: 100vh;
-    }
+  margin: 0;
+  color: var(--ink);
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(147, 197, 253, .75), transparent 32rem),
+    radial-gradient(circle at 88% 8%, rgba(227, 167, 47, .28), transparent 24rem),
+    linear-gradient(135deg, #f0f4f8 0%, #e2e8f0 48%, #cbd5e1 100%);
+  min-height: 100vh;
+}
 
     .shell {
       width: min(1220px, calc(100% - 32px));
@@ -1310,7 +1310,7 @@ string GetDashboardHtml() =>
       height: 10px;
       border-radius: 999px;
       background: var(--green);
-      box-shadow: 0 0 0 8px rgba(15, 107, 79, .12);
+      box-shadow: 0 0 0 8px rgba(37, 99, 235, .12);
       animation: pulse 1.6s infinite;
     }
 
@@ -1342,7 +1342,7 @@ string GetDashboardHtml() =>
       width: 92px;
       height: 92px;
       border-radius: 50%;
-      background: rgba(15, 107, 79, .10);
+      background: rgba(37, 99, 235, .10);
     }
 
     .metric span {
@@ -1463,7 +1463,7 @@ string GetDashboardHtml() =>
       border-radius: 18px;
       background:
         linear-gradient(180deg, rgba(255, 255, 255, .72), rgba(255, 255, 255, .28)),
-        radial-gradient(circle at 12% 18%, rgba(15, 107, 79, .10), transparent 28%);
+        radial-gradient(circle at 12% 18%, rgba(37, 99, 235, .10), transparent 28%);
       overflow: hidden;
     }
 
@@ -1618,7 +1618,7 @@ string GetDashboardHtml() =>
 
     button {
       cursor: pointer;
-      border-color: rgba(15, 107, 79, .28);
+      border-color: rgba(37, 99, 235, .28);
       background: var(--green);
       color: white;
       font-weight: 800;
@@ -1985,7 +1985,7 @@ string GetDashboardHtml() =>
 
       const xFor = index => pad.left + (points.length === 1 ? 0 : index * innerWidth / (points.length - 1));
       const yFor = value => pad.top + (max - value) * innerHeight / (max - min || 1);
-      const colors = ["#0f6b4f", "#315f8f", "#b94a48", "#e3a526", "#6f6aa8", "#2c8c99", "#8a6a2f"];
+      const colors = ["#2563eb", "#1e3a8a", "#b94a48", "#e3a526", "#6f6aa8", "#2c8c99", "#8a6a2f"];
       const groups = new Map();
 
       for (const point of points) {

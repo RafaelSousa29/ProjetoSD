@@ -1,7 +1,7 @@
 sensor_id=S101
-battery_level=17
+battery_level=0
 auto_send_enabled=False
 auto_send_interval_seconds=20
 resume_auto_send_after_charging=False
 maintenance_reason=Bateria fraca
-updated_at=2026-05-19T18:08:19
+updated_at=2026-05-28T10:40:55

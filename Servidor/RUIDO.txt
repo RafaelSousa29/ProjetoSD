@@ -1,4 +1,9 @@
-2026-05-19T18:54:51 | Gateway: GW01 | Sensor: S102 | Valor: 87
-2026-05-19T18:54:56 | Gateway: GW01 | Sensor: S102 | Valor: 60
-2026-05-19T18:55:00 | Gateway: GW01 | Sensor: S102 | Valor: 60
-2026-05-19T18:56:20 | Gateway: GW01 | Sensor: S102 | Valor: 0
+2026-05-28T10:00:27 | Gateway: GW01 | Sensor: S101 | Valor: 64
+2026-05-28T10:00:42 | Gateway: GW01 | Sensor: S102 | Valor: 87
+2026-05-28T10:00:48 | Gateway: GW01 | Sensor: S101 | Valor: 55
+2026-05-28T10:01:03 | Gateway: GW01 | Sensor: S102 | Valor: 77
+2026-05-28T10:01:08 | Gateway: GW01 | Sensor: S101 | Valor: 84
+2026-05-28T10:01:29 | Gateway: GW01 | Sensor: S101 | Valor: 40
+2026-05-28T10:02:46 | Gateway: GW01 | Sensor: S101 | Valor: 60
+2026-05-28T10:02:51 | Gateway: GW01 | Sensor: S102 | Valor: 90
+2026-05-28T10:03:06 | Gateway: GW01 | Sensor: S101 | Valor: 82

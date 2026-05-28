@@ -1,0 +1,6 @@
+2026-05-28T10:00:27 | Gateway: GW01 | Sensor: S101 | Valor: 50
+2026-05-28T10:00:48 | Gateway: GW01 | Sensor: S101 | Valor: 86
+2026-05-28T10:01:08 | Gateway: GW01 | Sensor: S101 | Valor: 44
+2026-05-28T10:01:28 | Gateway: GW01 | Sensor: S101 | Valor: 41
+2026-05-28T10:02:46 | Gateway: GW01 | Sensor: S101 | Valor: 89
+2026-05-28T10:03:06 | Gateway: GW01 | Sensor: S101 | Valor: 51
