@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("PubSubBroker")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+45c650bf8c228438a3e79998e79eaa3c84d1ecf3")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5c888e71fde34e513f3952d36b8bfbead3ba73a4")]
 [assembly: System.Reflection.AssemblyProductAttribute("PubSubBroker")]
 [assembly: System.Reflection.AssemblyTitleAttribute("PubSubBroker")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
